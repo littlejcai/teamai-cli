@@ -3,7 +3,13 @@
 // `import('teamai-cli/dist/desktop-api.js')` WITHOUT executing the CLI —
 // src/index.ts calls program.parse() at module scope and must stay the CLI-only
 // entry. Policy: additive re-exports only; no kernel logic here.
-export { ensureAstReady, getParser, grammarForExtension } from './wiki-engine/code-knowledge/ast/parser-registry.js';
+export {
+    ensureAstReady,
+    getParser,
+    getLanguage,
+    getQuery,
+    grammarForExtension,
+} from './wiki-engine/code-knowledge/ast/parser-registry.js';
 
 // JSON output layer (teamai-json/v1)
 export { buildStatusPayload, buildStatusAllPayload, buildListPayload } from './json-status.js';
