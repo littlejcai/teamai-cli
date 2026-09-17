@@ -1,0 +1,190 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`hooks list --json > emits per-tool status, builtin and team hooks 1`] = `"{"schema":"teamai-json/v1","command":"hooks","tools":[{"tool":"claude","status":"installed","settingsPath":"~/.claude/settings.json"},{"tool":"cursor","status":"installed","settingsPath":"~/.cursor/hooks.json"}],"builtin":[{"event":"SessionStart","matcher":null,"command":"node hook-dispatch.js --bg-only"},{"event":"Stop","matcher":null,"command":"node hook-dispatch.js"}],"team":[{"key":"lint","event":"Stop","matcher":null,"command":"npm run lint","tools":["claude"],"roles":["devops"]}]}"`;
+
+exports[`list --json > emits repo sections for every resource type 1`] = `
+"{
+  "schema": "teamai-json/v1",
+  "command": "list",
+  "source": "all",
+  "types": [
+    "skills",
+    "rules",
+    "docs",
+    "env",
+    "agents",
+    "hooks",
+    "mcp"
+  ],
+  "repo": {
+    "skills": [
+      {
+        "name": "s1",
+        "path": "/tmp/repo/skills/s1",
+        "contributors": [
+          "alice"
+        ]
+      }
+    ],
+    "rules": [],
+    "docs": [],
+    "env": [
+      {
+        "key": "GITHUB_TOKEN",
+        "value": "***MASKED***",
+        "revealed": false,
+        "description": "github token"
+      }
+    ],
+    "agents": [],
+    "hooks": [
+      {
+        "id": "on-stop",
+        "event": "Stop",
+        "description": "team stop hook"
+      }
+    ],
+    "mcp": [
+      {
+        "name": "ctx7",
+        "transport": "stdio",
+        "endpoint": "npx -y ctx7",
+        "description": "docs"
+      }
+    ]
+  },
+  "localAgents": []
+}"
+`;
+
+exports[`mcp list --json > emits servers with secrets + install state and detected tools 1`] = `
+"{
+  "schema": "teamai-json/v1",
+  "command": "mcp",
+  "servers": [
+    {
+      "name": "ctx7",
+      "transport": "stdio",
+      "endpoint": "npx -y ctx7",
+      "description": "docs lookup",
+      "roles": [
+        "dev"
+      ],
+      "secrets": {
+        "required": [],
+        "missing": []
+      },
+      "installedIn": [
+        "claude"
+      ]
+    },
+    {
+      "name": "http-srv",
+      "transport": "http",
+      "endpoint": "https://mcp.example.com",
+      "description": null,
+      "roles": null,
+      "secrets": {
+        "required": [],
+        "missing": []
+      },
+      "installedIn": []
+    }
+  ],
+  "tools": [
+    {
+      "tool": "claude",
+      "file": "~/.claude/mcp.json"
+    }
+  ]
+}"
+`;
+
+exports[`members --json > emits the parsed roster with isSelf marks 1`] = `
+"{
+  "schema": "teamai-json/v1",
+  "command": "members",
+  "count": 1,
+  "members": [
+    {
+      "username": "alice",
+      "displayName": "Alice",
+      "role": "dev",
+      "projects": [
+        "proj1"
+      ],
+      "registeredAt": "2026-01-01T00:00:00.000Z",
+      "isSelf": true
+    }
+  ]
+}"
+`;
+
+exports[`status --json > emits scope, git state, resource counts and unpushed locals 1`] = `
+"{
+  "schema": "teamai-json/v1",
+  "command": "status",
+  "scope": "user",
+  "projectRoot": null,
+  "dataHome": "~/.teamai",
+  "repo": {
+    "remote": "https://example.com/team/repo.git",
+    "localPath": "/tmp/repo",
+    "ahead": 2,
+    "behind": 0,
+    "modified": [
+      "skills/a/SKILL.md"
+    ],
+    "upToDate": false
+  },
+  "state": {
+    "lastPush": "2026-01-01T00:00:00.000Z",
+    "lastPull": null
+  },
+  "resources": {
+    "skills": 1,
+    "rules": 0,
+    "docs": 3,
+    "env": 1,
+    "agents": 0,
+    "hooks": 2,
+    "mcp": 0
+  },
+  "localUnpushed": [
+    {
+      "type": "skills",
+      "count": 1,
+      "names": [
+        "my-new-skill"
+      ]
+    }
+  ],
+  "verbose": false
+}"
+`;
+
+exports[`status --json > status --all --json enumerates partitions with verdicts 1`] = `
+"{
+  "schema": "teamai-json/v1",
+  "command": "status",
+  "scope": "all",
+  "partitionsRoot": "~/.teamai/projects",
+  "partitions": [
+    {
+      "slug": "active",
+      "state": "active",
+      "projectPath": "/repos/active",
+      "scope": null,
+      "kind": null
+    },
+    {
+      "slug": "gone",
+      "state": "orphan",
+      "projectPath": "/repos/gone",
+      "scope": null,
+      "kind": null
+    }
+  ],
+  "orphanCount": 1
+}"
+`;

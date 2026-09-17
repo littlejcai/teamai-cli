@@ -14,6 +14,7 @@ import { managedMcpManifestPath, managedMcpManifestKey, getDataHome } from './ty
 import { readJson } from './utils/fs.js';
 import type { ManagedMcpManifest } from './types.js';
 import { getUserHome } from './utils/home.js';
+import { emitJson, isJsonMode } from './json-output.js'; // [teamai-desktop] JSON output layer
 
 function displayPath(p: string): string {
   const home = getUserHome();
@@ -27,6 +28,10 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
   const servers = await parseTeamMcpServers(localConfig.repo.localPath);
 
   if (servers.length === 0) {
+    if (isJsonMode()) {
+      emitJson({ command: 'mcp', servers: [], tools: [] }); // [teamai-desktop] JSON output layer
+      return;
+    }
     log.info('No team MCP servers defined (mcp/mcp.yaml not found or empty)');
     return;
   }
@@ -40,6 +45,31 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
       localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
     ),
   )) ?? {};
+
+  if (isJsonMode()) { // [teamai-desktop] JSON output layer — same data as the human output
+    emitJson({
+      command: 'mcp',
+      servers: servers.map((s) => {
+        const endpoint = s.transport === 'stdio' ? `${s.command} ${(s.args ?? []).join(' ')}`.trim() : s.url;
+        const needed = referencedVars(s);
+        const missing = needed.filter((v) => !vars[v]);
+        const installedIn = targets
+          .filter((t) => (manifest[managedMcpManifestKey(t.tool, t.projectScope)] ?? []).some((r) => r.name === s.name))
+          .map((t) => t.tool);
+        return {
+          name: s.name,
+          transport: s.transport,
+          endpoint,
+          description: s.description ?? null,
+          roles: s.roles ?? null,
+          secrets: { required: needed, missing },
+          installedIn,
+        };
+      }),
+      tools: targets.map((t) => ({ tool: t.tool, file: displayPath(t.file) })),
+    });
+    return;
+  }
 
   console.log(`Team MCP servers — mcp/mcp.yaml (${servers.length}):`);
   console.log('');

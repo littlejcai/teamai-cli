@@ -22,6 +22,8 @@ import { projectsRootDir, readAnchorFile, projectSlug, legacyProjectSlug } from 
 import { maskEnvValue } from './resources/env.js';
 import { parseTeamMcpServers } from './resources/mcp.js';
 import { parseHooksYaml } from './resources/hooks.js';
+import { emitJson, isJsonMode } from './json-output.js'; // [teamai-desktop] JSON output layer
+import { buildStatusPayload, buildStatusAllPayload, buildListPayload } from './json-status.js'; // [teamai-desktop]
 
 export interface ListOptions extends GlobalOptions {
   /** Where to look for resources: 'repo' (default for backwards compat),
@@ -35,11 +37,19 @@ export interface ListOptions extends GlobalOptions {
 
 export async function status(options: GlobalOptions): Promise<void> {
   if (options.all) {
+    if (isJsonMode()) {
+      emitJson(await buildStatusAllPayload()); // [teamai-desktop] JSON output layer
+      return;
+    }
     await statusAll();
     return;
   }
   // Auto-detect scope
   const { localConfig, teamConfig } = await autoDetectInit();
+  if (isJsonMode()) {
+    emitJson(await buildStatusPayload(options)); // [teamai-desktop] JSON output layer
+    return;
+  }
   const scopeLabel = localConfig.scope;
 
   // Scope info
@@ -240,6 +250,12 @@ async function statusAll(): Promise<void> {
 }
 
 export async function list(type: string | undefined, options: ListOptions): Promise<void> {
+  if (isJsonMode()) {
+    const payload = await buildListPayload(type, options); // [teamai-desktop] JSON output layer
+    emitJson(payload);
+    if (typeof payload.error === 'string') process.exitCode = 1;
+    return;
+  }
   // Auto-detect scope
   const { localConfig, teamConfig } = await autoDetectInit();
   const repoPath = localConfig.repo.localPath;

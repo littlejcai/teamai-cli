@@ -4,6 +4,7 @@ import { setVerbose, setSilent, log } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
 import { TEAMAI_HOOK_SUBCOMMANDS } from './hooks.js';
 import { registerPackagesCommand } from './pkg/register-command.js';
+import { emitJson, setJsonMode, takeDryRunPlan } from './json-output.js'; // [teamai-desktop] JSON output layer
 
 // Commands that migrate a legacy `<repo>/.teamai/` into the partition on first
 // run (issue #374 P1-3). Only write commands trigger it; read-only commands rely
@@ -90,19 +91,24 @@ program
   .description('Pull team resources and inject into local AI tools')
   .option('--silent', 'Silent mode (for hooks)')
   .option('--force', 'Force full sync even if repo is unchanged')
+  .option('--json', 'Emit machine-readable JSON (teamai-desktop)') // [teamai-desktop]
   .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
     if (cmdOpts.silent) setSilent(true);
+    if (cmdOpts.json) setJsonMode(); // [teamai-desktop] JSON output mode
     const { pull } = await import('./pull.js');
     await pull({ ...globalOpts, ...cmdOpts });
+    if (cmdOpts.json) emitJson({ command: 'pull', dryRun: !!(cmdOpts.dryRun ?? globalOpts.dryRun), plan: takeDryRunPlan() }); // [teamai-desktop]
   });
 
 program
   .command('status')
   .description('Show local vs team repo diff')
   .option('--all', 'List every project data partition under ~/.teamai/projects (flags stale/orphan ones)')
+  .option('--json', 'Emit machine-readable JSON (teamai-desktop)') // [teamai-desktop]
   .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
+    if (cmdOpts.json) setJsonMode(); // [teamai-desktop] JSON output mode
     const { status } = await import('./status.js');
     await status({ ...globalOpts, ...cmdOpts });
   });
@@ -113,8 +119,10 @@ program
   .option('--source <src>', 'Where to look for skills: repo | local | all', 'all')
   .option('--agent <name>', 'Filter local agents by id (only applies to skills)')
   .option('--reveal', 'Show env values in plaintext (default: masked)')
+  .option('--json', 'Emit machine-readable JSON (teamai-desktop)') // [teamai-desktop]
   .action(async (type, cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
+    if (cmdOpts.json) setJsonMode(); // [teamai-desktop] JSON output mode
     const { list } = await import('./status.js');
     await list(type, { ...globalOpts, ...cmdOpts });
   });
@@ -185,9 +193,11 @@ excludeCmd
 const membersCmd = program
   .command('members')
   .description('Manage team members')
-  .action(async () => {
+  .option('--json', 'Emit machine-readable JSON (teamai-desktop)') // [teamai-desktop]
+  .action(async (cmdOpts) => {
     // Default action: list members (backward compatible)
     const globalOpts = program.opts() as GlobalOptions;
+    if (cmdOpts.json) setJsonMode(); // [teamai-desktop] JSON output mode
     const { listMembers } = await import('./members.js');
     await listMembers(globalOpts);
   });
@@ -561,8 +571,10 @@ const hooksCmd = program
 hooksCmd
   .command('list')
   .description('List hook install status + effective built-in (A) and team (B) hooks')
-  .action(async () => {
+  .option('--json', 'Emit machine-readable JSON (teamai-desktop)') // [teamai-desktop]
+  .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
+    if (cmdOpts.json) setJsonMode(); // [teamai-desktop] JSON output mode
     const { hooksList } = await import('./hooks-cmd.js');
     await hooksList(globalOpts);
   });
@@ -596,8 +608,10 @@ const mcpCmd = program
 mcpCmd
   .command('list')
   .description('List team MCP servers and their per-tool install status')
-  .action(async () => {
+  .option('--json', 'Emit machine-readable JSON (teamai-desktop)') // [teamai-desktop]
+  .action(async (cmdOpts) => {
     const globalOpts = program.opts() as GlobalOptions;
+    if (cmdOpts.json) setJsonMode(); // [teamai-desktop] JSON output mode
     const { mcpList } = await import('./mcp-cmd.js');
     await mcpList(globalOpts);
   });

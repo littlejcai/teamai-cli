@@ -6,6 +6,7 @@ import { pullRepo } from './utils/git.js';
 import { log } from './utils/logger.js';
 import { MemberConfigSchema } from './types.js';
 import type { GlobalOptions, MemberConfig } from './types.js';
+import { emitJson, isJsonMode } from './json-output.js'; // [teamai-desktop] JSON output layer
 
 /**
  * Read a specific member's config from the repo.
@@ -85,7 +86,34 @@ export async function listMembers(options: GlobalOptions): Promise<void> {
   const yamlFiles = files.filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'));
 
   if (yamlFiles.length === 0) {
+    if (isJsonMode()) {
+      emitJson({ command: 'members', count: 0, members: [] }); // [teamai-desktop] JSON output layer
+      return;
+    }
     log.info('No team members registered');
+    return;
+  }
+
+  if (isJsonMode()) { // [teamai-desktop] JSON output layer — collect instead of printing
+    const members: Array<Record<string, unknown>> = [];
+    for (const file of yamlFiles) {
+      const content = await readFileSafe(path.join(membersDir, file));
+      if (!content) continue;
+      try {
+        const member = MemberConfigSchema.parse(YAML.parse(content));
+        members.push({
+          username: member.username,
+          displayName: member.displayName ?? null,
+          role: member.role ?? null,
+          projects: member.projects ?? [],
+          registeredAt: member.registeredAt ?? null,
+          isSelf: member.username === localConfig.username,
+        });
+      } catch {
+        // invalid member file — skipped in JSON output (log is silenced)
+      }
+    }
+    emitJson({ command: 'members', count: members.length, members });
     return;
   }
 

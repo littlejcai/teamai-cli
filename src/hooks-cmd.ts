@@ -7,6 +7,7 @@ import { log } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
 import { resolveHookScope } from './types.js';
 import { getUserHome } from './utils/home.js';
+import { emitJson, isJsonMode } from './json-output.js'; // [teamai-desktop] JSON output layer
 
 type HookListStatus = HookStatus | 'not configured';
 
@@ -96,9 +97,32 @@ export async function hooksList(_options: GlobalOptions): Promise<void> {
         });
     }
 
-    console.log(formatHooksList(rows));
-
+    // [teamai-desktop] JSON branch must run before any human output; parsing
+    // team hooks is a pure read, so hoisting it above the table print is safe.
     const teamDefs = await parseTeamHooks(localConfig.repo.localPath);
+
+    if (isJsonMode()) {
+        emitJson({
+            command: 'hooks',
+            tools: rows.map((r) => ({ tool: r.tool, status: r.status, settingsPath: r.settingsPath })),
+            builtin: builtinHookDefs('claude').map((d) => ({
+                event: d.event,
+                matcher: d.matcher && d.matcher !== '*' ? d.matcher : null,
+                command: d.command,
+            })),
+            team: teamDefs.map((d) => ({
+                key: d.key,
+                event: d.event,
+                matcher: d.matcher ?? null,
+                command: d.command,
+                tools: d.tools && d.tools.length > 0 ? d.tools : null,
+                roles: d.roles && d.roles.length > 0 ? d.roles : null,
+            })),
+        });
+        return;
+    }
+
+    console.log(formatHooksList(rows));
 
     console.log('');
     console.log('Built-in hooks (A) — teamai operational (injected into every tool):');

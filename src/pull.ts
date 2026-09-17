@@ -38,6 +38,7 @@ import { getUserHome } from './utils/home.js';
 import { acquireLock, releaseLock } from './update.js';
 import { mirrorLearnings } from './utils/learnings-mirror.js';
 import { withTimeout } from './utils/async.js';
+import { recordDryRunEntry } from './json-output.js'; // [teamai-desktop] JSON output layer
 
 // A timed-out report still owns its success bookkeeping. Do not start another
 // batch in this process until it settles and finishes consuming its events.
@@ -686,6 +687,7 @@ async function pullForScope(
         if (items.length > 0) {
           log.info(`[${scopeLabel}] [dry-run] Would sync ${items.length} rule(s)${skipped.length > 0 ? ` (skipped ${skipped.length} by tags)` : ''}`);
         }
+        recordDryRunEntry({ scope: scopeLabel, type: 'rules', count: items.length, skippedByTags: skipped.length }); // [teamai-desktop]
       } else {
         // Always call pullAllRules, even with an empty set: it also cleans up
         // stale local rule files and deactivates the OpenCode instructions glob
@@ -758,6 +760,7 @@ async function pullForScope(
 
       if (options.dryRun) {
         log.info(`[${scopeLabel}] [dry-run] Would sync ${varCount} env variable(s)`);
+        recordDryRunEntry({ scope: scopeLabel, type: 'env', count: varCount }); // [teamai-desktop]
       } else {
         await envHandler.pullItem(items[0], freshConfig, localConfig);
         const teamaiHome = getDataHome(localConfig);
@@ -773,6 +776,7 @@ async function pullForScope(
 
       if (options.dryRun) {
         log.info(`[${scopeLabel}] [dry-run] Would sync ${fileCount} docs`);
+        recordDryRunEntry({ scope: scopeLabel, type: 'docs', count: fileCount }); // [teamai-desktop]
       } else {
         await docsHandler.pullItem(items[0], freshConfig, localConfig);
         log.success(`[${scopeLabel}] Synced ${fileCount} docs`);
@@ -787,6 +791,8 @@ async function pullForScope(
     if (options.dryRun) {
       const added = items.filter(i => !existingNames.has(i.name));
       const updated = items.filter(i => existingNames.has(i.name));
+
+      recordDryRunEntry({ scope: scopeLabel, type, count: items.length, added: added.map(i => i.name), updated: updated.map(i => i.name), skippedByTags }); // [teamai-desktop]
 
       if (added.length > 0 && type === 'skills') {
         log.info(`[${scopeLabel}] [dry-run] Would pull ${items.length} ${type} (${added.length} new, ${updated.length} updated)`);
