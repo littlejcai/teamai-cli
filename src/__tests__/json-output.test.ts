@@ -345,12 +345,12 @@ describe('mcp list --json', () => {
             { name: 'http-srv', transport: 'http', url: 'https://mcp.example.com', description: null, roles: null },
         ]);
         mocks.resolveTargets.mockResolvedValue([
-            { tool: 'claude', file: '/home/testuser/.claude/mcp.json', projectScope: undefined },
+            { tool: 'claude', file: '/home/testuser/.claude/mcp.json', projectScope: false },
         ]);
         mocks.buildVars.mockResolvedValue({ GITHUB_TOKEN: 'x' });
         // ctx7 already installed in claude → manifest lookup must find it
         mocks.readJson.mockResolvedValue({
-            [managedMcpManifestKey('claude', undefined)]: [{ name: 'ctx7' }],
+            [managedMcpManifestKey('claude', false)]: [{ name: 'ctx7' }],
         });
         const out = await captureConsole(() => mcpList({}));
         const payload = JSON.parse(out);
