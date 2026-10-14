@@ -6,6 +6,7 @@ import fs from 'node:fs/promises';
 import YAML from 'yaml';
 import simpleGit from 'simple-git';
 import { LocalConfigSchema, TeamaiConfigSchema, getDataHome, type LocalConfig } from './types.js';
+import { scanTeamRepoNamespaces } from './resources/skills.js';
 import { getAllHandlers } from './resources/index.js';
 import { loadRolesManifest } from './roles.js';
 import { loadProjectsManifest } from './projects.js';
@@ -50,7 +51,7 @@ export async function desktopSnapshot(ctx: DesktopContext) {
   if (!loaded) return { state: 'uninitialized' as const, resources: [], changes: [], roles: [], namespaces: [] };
   const { config, team, configPath } = loaded;
   const resources: Array<{ name: string; type: string; source: string; path: string }> = [];
-  const changes: Array<{ name: string; type: string; path: string; status: string }> = [];
+  const changes: Array<{ name: string; type: string; path: string; status: string; before?: string }> = [];
   for (const handler of getAllHandlers()) {
     for (const item of await handler.scanTeamForPull(team, config)) {
       if(handler.type==='env')continue;
@@ -63,9 +64,15 @@ export async function desktopSnapshot(ctx: DesktopContext) {
   }
   let git: { ahead: number; behind: number; modified: string[]; error?: string };
   try {
-    const s = await simpleGit(config.repo.kind === 'self' ? config.repo.businessRepoRoot! : config.repo.localPath).env({...process.env,GIT_OPTIONAL_LOCKS:'0'}).status();
-    git = { ahead: s.ahead, behind: s.behind, modified: s.files.map(f => f.path) };
+    const raw = await simpleGit(config.repo.kind === 'self' ? config.repo.businessRepoRoot! : config.repo.localPath).raw(['--no-pager','--no-optional-locks','status','--porcelain=v1','--branch','-z']);
+    const entries=raw.split('\0');const branch=entries.shift()??'';const modified:string[]=[];
+    for(let i=0;i<entries.length;i++){const entry=entries[i];if(!entry)continue;modified.push(entry.slice(3));if(/[RC]/.test(entry.slice(0,2)))i++;}
+    git = { ahead: Number(branch.match(/ahead (\d+)/)?.[1]??0), behind: Number(branch.match(/behind (\d+)/)?.[1]??0), modified };
   } catch (e) { git = { ahead: 0, behind: 0, modified: [], error: (e as Error).message }; }
+  const teamFile='teamai.yaml';const gitRoot=config.repo.kind==='self'?config.repo.businessRepoRoot!:config.repo.localPath;
+  const teamRelative=path.relative(gitRoot,path.join(config.repo.localPath,teamFile)).replaceAll('\\','/');
+  const teamConfigChanged=git.modified.some(p=>p.replaceAll('\\','/')===teamRelative);
+  if(teamConfigChanged){const file=path.join(config.repo.localPath,'teamai.yaml');resources.push({name:'teamai.yaml',type:'config',source:'repo',path:file});const before=await simpleGit(gitRoot).raw(['--no-pager','show',`HEAD:${teamRelative}`]).catch(()=>'');changes.push({name:'teamai.yaml',type:'config',path:file,status:'modified',before});}
   const roles = await loadRolesManifest(config.repo.localPath).catch(e => {
     if (String(e).includes('not found')) return null; throw e;
   });
@@ -76,7 +83,7 @@ export async function desktopSnapshot(ctx: DesktopContext) {
     username: config.username, role: config.primaryRole, scope: config.scope, git,
     lastPull: state.lastPull ?? null, lastPush: state.lastPush ?? null,
     resources, changes, roles: roles?.roles ?? [], projects: projects?.projects ?? [],
-    namespaces: [...new Set(roles?.roles.flatMap(r => r.resources.skills) ?? [])],
+    namespaces: [...new Set([...(roles?.roles.flatMap(r => r.resources.skills) ?? []),...await scanTeamRepoNamespaces(config.repo.localPath)])],
     needsMigration: Boolean(roles && !config.primaryRole), enabledAgents: config.enabledAgents ?? [],
   };
 }

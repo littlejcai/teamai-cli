@@ -26,6 +26,7 @@ it('returns real repo and local resources without changing config, resources or 
   execFileSync('git',['init',repo]);execFileSync('git',['-C',repo,'add','.']);execFileSync('git',['-C',repo,'-c','user.name=Fixture','-c','user.email=fixture@example.test','commit','-m','fixture']);
   await fs.writeFile(path.join(root,'.teamai/config.yaml'),YAML.stringify({username:'fixture',scope:'project',projectRoot:root,repo:{localPath:repo,remote:'https://example.com/team.git'}}));
   const before=await tree(root);const s=await desktopSnapshot({scope:'project',projectRoot:root,home:root});expect(s.state).toBe('ready');expect(s.resources).toEqual(expect.arrayContaining([expect.objectContaining({name:'sample',type:'skills',source:'repo'})]));expect(await tree(root)).toEqual(before);
+  await fs.appendFile(path.join(repo,'teamai.yaml'),'description: Modified\n');const modified=await desktopSnapshot({scope:'project',projectRoot:root,home:root});expect(modified.changes).toEqual(expect.arrayContaining([expect.objectContaining({type:'config',name:'teamai.yaml'})]));expect(modified.changes.find(c=>c.type==='config')?.before).not.toContain('Modified');
  }finally{await fs.rm(root,{recursive:true,force:true});}
 });
 
