@@ -31,3 +31,9 @@ export { mcpList, mcpInject } from './mcp-cmd.js';
 export { hooksList, hooksInject } from './hooks-cmd.js';
 
 export type { GlobalOptions } from './types.js';
+
+// [teamai-desktop] Desktop output layer and isolated action entrypoints.
+export { desktopConfig, desktopSnapshot, desktopManifest } from './desktop-read.js';
+export { init } from './init.js';
+export { push } from './push.js';
+export { doctor } from './doctor.js';
