@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFile } from 'node:child_process';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -98,6 +97,35 @@ describe('getAgentVersion with an npm-installed CLI', () => {
 
   it('reads the version through the platform launcher', async () => {
     expect(await getAgentVersion('codebuddy')).toBe('2.5.0');
+  });
+});
+
+describe('getAgentVersion for Muse Code', () => {
+  let binDir: string;
+  let savedPath: string | undefined;
+
+  beforeEach(async () => {
+    binDir = await mkdtemp(path.join(os.tmpdir(), 'teamai-agent-version-muse-'));
+    savedPath = process.env.PATH;
+    // Verbatim `muse --version` output of Muse Code 1.4.6.
+    const output = 'Muse Code 1.4.6 (1.4.6-R6000.1)';
+    if (process.platform === 'win32') {
+      await writeFile(path.join(binDir, 'muse.cmd'), `@echo ${output}\r\n`);
+    } else {
+      const script = path.join(binDir, 'muse');
+      await writeFile(script, `#!/bin/sh\necho '${output}'\n`);
+      await chmod(script, 0o755);
+    }
+    process.env.PATH = `${binDir}${path.delimiter}${savedPath ?? ''}`;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = savedPath;
+    await rm(binDir, { recursive: true, force: true });
+  });
+
+  it('reads the release version from `muse --version`', async () => {
+    expect(await getAgentVersion('muse')).toBe('1.4.6');
   });
 });
 

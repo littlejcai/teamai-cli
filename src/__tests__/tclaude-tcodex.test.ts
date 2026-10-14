@@ -1,6 +1,5 @@
 // -*- coding: utf-8 -*-
 import { describe, it, expect } from 'vitest';
-import os from 'node:os';
 import path from 'node:path';
 import fs from 'fs-extra';
 
@@ -23,11 +22,12 @@ describe('tclaude/tcodex adapter integration', () => {
     it('tcodex has codex-compatible paths including hooks.json', async () => {
       const { TeamaiConfigSchema } = await import('../types.js');
       const config = TeamaiConfigSchema.parse({ team: 'test', repo: 'test/repo' });
+      // Same shape as codex: no rules dir, and an AGENTS.md in user scope only (#938, #945).
       expect(config.toolPaths.tcodex).toEqual({
         skills: '.tcodex/skills',
-        rules: '.tcodex/rules',
         settings: '.tcodex/hooks.json',
         agents: '.tcodex/agents',
+        userScope: { claudemd: '.tcodex/AGENTS.md' },
       });
     });
   });

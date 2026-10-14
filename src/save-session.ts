@@ -27,7 +27,8 @@ import {
 } from './session-collector.js';
 import { log, spinner } from './utils/logger.js';
 import { withTimeout } from './utils/async.js';
-import { getSessionLogsDir, usesReportsBranch } from './types.js';
+import { agentSessionIdFromEnv } from './utils/session-id.js';
+import { getSessionLogsDir, parseInstallScope, usesBranchWorktree } from './types.js';
 import type { GlobalOptions, LocalConfig } from './types.js';
 
 export interface SaveSessionOptions extends GlobalOptions {
@@ -58,7 +59,7 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
   }
 
   const sessionId =
-    options.sessionId || process.env.CLAUDE_SESSION_ID || mostRecentSessionId(events);
+    options.sessionId || (await agentSessionIdFromEnv()) || mostRecentSessionId(events);
   if (!sessionId) {
     log.error('Could not determine a session id. Pass --session-id <id>.');
     return;
@@ -96,20 +97,24 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
     return;
   }
 
+  // The flag reaches the loaders: a bare load migrates the legacy role config
+  // in place, which would write under --dry-run (#850).
+  const loadOpts = { dryRun: options.dryRun };
   let localConfig: LocalConfig;
   try {
-    if (options.scope === 'project') {
-      const cfg = await loadLocalConfigForScope('project', process.cwd());
+    const scope = options.scope === undefined ? undefined : parseInstallScope(options.scope);
+    if (scope === 'project') {
+      const cfg = await loadLocalConfigForScope('project', process.cwd(), loadOpts);
       if (!cfg) {
-        log.error('No project-level teamai config in the current directory.');
+        log.error('No workspace teamai config in the current directory.');
         return;
       }
       localConfig = cfg;
-    } else if (options.scope === 'user') {
-      localConfig = (await requireInit()).localConfig;
+    } else if (scope === 'user') {
+      localConfig = (await requireInit(loadOpts)).localConfig;
     } else {
-      const projectConfig = await detectProjectConfig();
-      localConfig = projectConfig ?? (await requireInit()).localConfig;
+      const projectConfig = await detectProjectConfig(undefined, undefined, loadOpts);
+      localConfig = projectConfig ?? (await requireInit(loadOpts)).localConfig;
     }
   } catch (e) {
     log.error(`Cannot push: ${(e as Error).message}`);
@@ -135,13 +140,14 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
   // Non-HTTP repos: session summaries are report data → the teamai-reports
   // orphan branch, written through an isolated worktree so the default branch
   // (and in self mode, the user's active tree) is never touched.
-  if (usesReportsBranch(localConfig)) {
+  if (usesBranchWorktree(localConfig)) {
     const spin = spinner('Pushing session summary to team...').start();
     try {
       const { updateReports } = await import('./utils/reports-branch.js');
+      const { isPublished } = await import('./utils/branch-worktree.js');
       let rel: string | undefined;
       let ran = false;
-      const pushed = await withTimeout(
+      const pushed = isPublished(await withTimeout(
         updateReports(localConfig, async (wt) => {
           ran = true;
           const teamDir = path.join(wt, 'sessions', username);
@@ -152,7 +158,7 @@ export async function saveSession(options: SaveSessionOptions): Promise<void> {
         }),
         10_000,
         'Push timeout (10s)',
-      );
+      ));
       if (ran && !rel) {
         spin.info('Session already present in the team log — nothing to push.');
         return;

@@ -16,7 +16,6 @@ import { log } from './utils/logger.js';
 import {
     loadPendingReview,
     removePendingReview,
-    savePendingReview,
     type PendingReviewItem,
     type Risk,
 } from './review-store.js';
@@ -124,25 +123,26 @@ function renderShow(item: PendingReviewItem): void {
 async function applyOne(
     cwd: string,
     item: PendingReviewItem,
+    dryRun: boolean,
 ): Promise<{ ok: boolean; reason?: string }> {
     if (item.kind !== 'codebase-section') {
-        return { ok: false, reason: `kind ${item.kind} 不支持自动应用，请人工处理` };
+        return { ok: false, reason: `kind ${item.kind} does not support auto-apply; please handle manually` };
     }
 
     const { file, section } = item.target;
     if (!section) {
-        return { ok: false, reason: 'target.section 缺失' };
+        return { ok: false, reason: 'target.section is missing' };
     }
 
     const filePath = path.isAbsolute(file) ? file : path.join(cwd, file);
     if (!await fs.pathExists(filePath)) {
-        return { ok: false, reason: `目标文件不存在：${filePath}` };
+        return { ok: false, reason: `target file not found: ${filePath}` };
     }
 
     const oldMd = await fs.readFile(filePath, 'utf8');
     const body = String(item.payload['content'] ?? '');
     if (!body) {
-        return { ok: false, reason: 'payload.content 为空' };
+        return { ok: false, reason: 'payload.content is empty' };
     }
 
     try {
@@ -150,7 +150,7 @@ async function applyOne(
             source: item.source,
             syncedAt: new Date().toISOString(),
         });
-        await fs.writeFile(filePath, newMd, 'utf8');
+        if (!dryRun) await fs.writeFile(filePath, newMd, 'utf8');
         return { ok: true };
     } catch (err) {
         return { ok: false, reason: err instanceof Error ? err.message : String(err) };
@@ -164,7 +164,7 @@ async function applyOne(
  */
 export async function reviewCmd(opts: ReviewCmdOptions): Promise<void> {
     const cwd = process.cwd();
-    const { idArg, apply, reject, allApply, maxRisk = 'medium', json: jsonMode } = opts;
+    const { idArg, apply, reject, allApply, maxRisk = 'medium', json: jsonMode, dryRun = false } = opts;
 
     // ── all-apply 模式 ────────────────────────────────────
     if (allApply) {
@@ -178,21 +178,23 @@ export async function reviewCmd(opts: ReviewCmdOptions): Promise<void> {
 
         const results: Array<{ id: string; ok: boolean; reason?: string }> = [];
         for (const item of candidates) {
-            const result = await applyOne(cwd, item);
-            if (result.ok) {
+            const result = await applyOne(cwd, item, dryRun);
+            if (result.ok && !dryRun) {
                 await removePendingReview(cwd, item.id);
             }
             results.push({ id: item.id, ok: result.ok, reason: result.reason });
         }
 
         if (jsonMode) {
-            console.log(JSON.stringify({ results, skipped: skipped.map((s) => s.id) }));
+            console.log(JSON.stringify({ results, skipped: skipped.map((s) => s.id), ...(dryRun ? { dryRun: true } : {}) }));
             return;
         }
 
         const succeeded = results.filter((r) => r.ok);
         const failed = results.filter((r) => !r.ok);
-        const summary = `[review] --all-apply done: ${succeeded.length} succeeded, ${failed.length} failed, ${skipped.length} skipped`;
+        const summary = dryRun
+            ? `[dry-run] [review] --all-apply: ${succeeded.length} would apply, ${failed.length} failed, ${skipped.length} skipped`
+            : `[review] --all-apply done: ${succeeded.length} succeeded, ${failed.length} failed, ${skipped.length} skipped`;
         console.log(chalk.bold(summary));
         for (const fail of failed) {
             console.log(chalk.red(`  ✗ ${fail.id}: ${fail.reason}`));
@@ -224,40 +226,42 @@ export async function reviewCmd(opts: ReviewCmdOptions): Promise<void> {
     if (!item) {
         log.warn(`[review] not found: id="${idArg}"`);
         if (jsonMode) {
-            console.log(JSON.stringify({ ok: false, reason: `not found: id="${idArg}"` }));
+            console.log(JSON.stringify({ ok: false, reason: `not found: id="${idArg}"`, ...(dryRun ? { dryRun: true } : {}) }));
         }
         return;
     }
 
     // ── reject 模式 ───────────────────────────────────────
     if (reject) {
-        await removePendingReview(cwd, idArg);
+        if (!dryRun) await removePendingReview(cwd, idArg);
 
         if (jsonMode) {
-            console.log(JSON.stringify({ ok: true, action: 'reject', id: idArg }));
+            console.log(JSON.stringify({ ok: true, action: 'reject', id: idArg, ...(dryRun ? { dryRun: true } : {}) }));
             return;
         }
-        console.log(chalk.yellow(`[review] 已拒绝：${idArg}`));
+        console.log(chalk.yellow(dryRun ? `[dry-run] [review] Would reject: ${idArg}` : `[review] rejected: ${idArg}`));
         return;
     }
 
     // ── apply 模式 ────────────────────────────────────────
     if (apply) {
-        const result = await applyOne(cwd, item);
+        const result = await applyOne(cwd, item, dryRun);
 
-        if (result.ok) {
+        if (result.ok && !dryRun) {
             await removePendingReview(cwd, idArg);
         }
 
         if (jsonMode) {
-            console.log(JSON.stringify({ ok: result.ok, reason: result.reason, id: idArg }));
+            console.log(JSON.stringify({ ok: result.ok, reason: result.reason, id: idArg, ...(dryRun ? { dryRun: true } : {}) }));
             return;
         }
 
         if (result.ok) {
-            console.log(chalk.green(`[review] applied: ${idArg} → ${item.target.file}`));
+            console.log(chalk.green(dryRun
+                ? `[dry-run] [review] Would apply: ${idArg} → ${item.target.file}`
+                : `[review] applied: ${idArg} → ${item.target.file}`));
         } else {
-            console.log(chalk.red(`[review] 应用失败：${idArg} — ${result.reason}`));
+            console.log(chalk.red(`${dryRun ? '[dry-run] ' : ''}[review] apply failed: ${idArg} — ${result.reason}`));
         }
         return;
     }

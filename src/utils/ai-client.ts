@@ -118,7 +118,12 @@ export async function callClaude(
       log.debug(`[ai-client] using CLI: ${_cliInfo.cmd} (${_cliInfo.absPath})`);
     }
     log.debug(`[ai-client] calling ${_cliInfo.cmd}, timeout=${Math.round(timeoutMs / 1000)}s, prompt=${prompt.slice(0, 60).replace(/\n/g, ' ')}...`);
-    const child = spawn(_cliInfo.absPath, buildCliArgs(_cliInfo.cmd, prompt), { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(_cliInfo.absPath, buildCliArgs(_cliInfo.cmd, prompt), {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // Our own session, not the user's: its hooks would print the share-learnings hint into this stdout, which we return as our answer.
+      env: { ...process.env, TEAMAI_CONTRIBUTE_HINT_DISABLED: '1' },
+    });
 
     child.stdout?.on('data', (chunk: Buffer) => chunks.push(chunk));
     child.stderr?.on('data', (chunk: Buffer) => errChunks.push(chunk));
@@ -198,7 +203,7 @@ async function runWithConcurrency<T>(
   tasks: Array<{ prompt: string; parse: (output: string) => T }>,
   concurrency: number
 ): Promise<PromiseSettledResult<T>[]> {
-  const results: PromiseSettledResult<T>[] = new Array(tasks.length);
+  const results = Array.from<PromiseSettledResult<T>>({ length: tasks.length });
   let running = 0;
   let index = 0;
 

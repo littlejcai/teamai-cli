@@ -2,7 +2,7 @@
 /**
  * End-to-end data flow verification for the Phase 3 + Phase 4 pipeline.
  *
- * Simulates: recall → incrementRecalled → Stop hook transcript parse →
+ * Simulates: recall → incrementRecalled → Stop hook adoption →
  * incrementUpvoted → syncVotesToTeam → buildIndex (confidence + hotness) →
  * search (cold penalty applied)
  */
@@ -14,10 +14,8 @@ import YAML from 'yaml';
 import matter from 'gray-matter';
 
 import { incrementRecalled, incrementUpvoted, syncVotesToTeam, loadUserVotes } from '../votes.js';
-import { parseTranscriptForVotes } from '../transcript-parser.js';
 import { buildIndex, loadIndex, search } from '../utils/search-index.js';
 import { computeAllConfidence, writeBackConfidence } from '../maintenance/confidence.js';
-import { annotateHotness, HOT_THRESHOLD } from '../maintenance/hot-cold.js';
 import { findPruneCandidates } from '../maintenance/prune.js';
 import type { UserVotesV2 } from '../types.js';
 
@@ -67,25 +65,8 @@ describe('Phase 3+4 end-to-end data flow', () => {
     expect(afterRecall.votes['outdated-pattern'].recalled_count).toBe(1);
     expect(afterRecall.deltas['api-retry'].recalled_delta).toBe(3);
 
-    // ─── Step 2: Simulate Stop hook (transcript parse → incrementUpvoted) ───
-    // Create a fake transcript with referenced-doc-ids
-    const transcriptPath = path.join(tmpDir, 'transcript.jsonl');
-    const transcriptEntry = {
-      type: 'assistant',
-      message: {
-        content: [{
-          type: 'text',
-          text: 'Here is the solution.\n\n<!-- teamai:referenced-doc-ids: [api-retry] -->',
-        }],
-      },
-    };
-    fs.writeFileSync(transcriptPath, JSON.stringify(transcriptEntry) + '\n');
-
-    const voteData = await parseTranscriptForVotes(transcriptPath);
-    expect(voteData.referencedDocIds).toContain('api-retry');
-    expect(voteData.referencedDocIds).not.toContain('outdated-pattern');
-
-    await incrementUpvoted(localVotePath, voteData.referencedDocIds);
+    // ─── Step 2: Stop credits the adopted doc (the recall-attribution tests drive how) ───
+    await incrementUpvoted(localVotePath, ['api-retry']);
 
     // Verify: api-retry now has upvoted_count=1
     const afterUpvote = await loadUserVotes(localVotePath);
@@ -160,8 +141,8 @@ describe('Phase 3+4 end-to-end data flow', () => {
     fs.writeFileSync(path.join(votesDir, 'user1.yaml'), YAML.stringify(v2));
 
     const map = await computeAllConfidence(votesDir);
-    const updated = await writeBackConfidence(learningsDir, map);
-    expect(updated).toBe(1);
+    const written = await writeBackConfidence([learningsDir], map);
+    expect(written).toEqual([path.join(learningsDir, 'test-doc.md')]);
 
     // Verify frontmatter has confidence
     const afterContent = fs.readFileSync(path.join(learningsDir, 'test-doc.md'), 'utf-8');
@@ -180,7 +161,7 @@ describe('Phase 3+4 end-to-end data flow', () => {
     const content = matter.stringify('Brand new learning.', { title: 'new-doc', date: '2026-07-01', tags: ['test'] });
     fs.writeFileSync(path.join(learningsDir, 'new-doc.md'), content);
 
-    const candidates = await findPruneCandidates(learningsDir, votesDir);
+    const candidates = await findPruneCandidates([learningsDir], votesDir);
     expect(candidates).toHaveLength(0);
   });
 });

@@ -1,41 +1,177 @@
 /**
- * Manage the `teamai-reports` orphan branch via an isolated git worktree.
+ * The `teamai-reports` orphan branch, plus the disposable worktree that stages
+ * knowledge pull requests off the user's active tree.
  *
- * Used for every non-HTTP team repo (`kind !== 'http'`):
- *  - self: worktree under <business-repo>/.teamai/reports-wt
- *  - git / legacy: sibling of the clone (`<dirname(localPath)>/reports-wt`) so
- *    clone `reset --hard` cannot nest-destroy it
- *
- * Why an orphan branch + dedicated worktree?
- *  - High-frequency report data (members/sessions/votes/stats) must NOT pollute
- *    the default branch, so members can use the team repo with branch protection.
- *    The orphan branch has an independent history, so main stays clean.
- *  - Report writes involve `git reset --hard` / rebase. Running those on the
- *    user's active working tree (self) or nesting the worktree inside the
- *    knowledge clone (git) would destroy uncommitted work. A separate worktree
- *    confines every destructive git op to the orphan-branch checkout.
- *
- * Concurrency: the branch is shared by the whole team, but each member only ever
- * writes their own `<user>.yaml`, so files never collide. Pushes race at the git
- * layer (non-fast-forward); we resolve with fetch + rebase + retry.
+ * The branch machinery itself lives in `branch-worktree.ts`; reports are one
+ * instance of it and learnings are the other. What stays here is the reports
+ * spec, the names its callers already import, and the knowledge worktree, which
+ * is not a side branch at all: it is a throwaway checkout of the default branch,
+ * while a dry-run checkout models the contents after a real refresh.
  */
+import os from 'node:os';
 import path from 'node:path';
 import fse from 'fs-extra';
-import type { SimpleGit } from 'simple-git';
-import { createGit, isGitRepo, getDefaultBranch, hasCommits, commitSkippingHooks, isDedicatedRepoRoot } from './git.js';
-import { acquireLock, releaseLock } from '../update.js';
-import { ensureDir, writeFile, pathExists } from './fs.js';
+import { createGit, getDefaultBranch, getHeadCommit, hasCommits } from './git.js';
+import { pathExists } from './fs.js';
 import { log } from './logger.js';
+import {
+  ForeignCheckoutError,
+  createBranchWorktree,
+  isPublished,
+  type BranchWrite,
+  type BranchWriteContext,
+  type EnsureWorktreeOptions,
+  type PublishResult,
+  type RefreshResult,
+} from './branch-worktree.js';
 import {
   REPORTS_BRANCH,
   REPORTS_WORKTREE_DIRNAME,
   REPORTS_LOCK_FILENAME,
   KNOWLEDGE_WORKTREE_DIRNAME,
-  getReportsDir,
-  isSelfMode,
-  usesReportsBranch,
+  getBusinessRoot,
   type LocalConfig,
 } from '../types.js';
+
+const reportsBranch = createBranchWorktree({
+  branch: REPORTS_BRANCH,
+  worktreeDirname: REPORTS_WORKTREE_DIRNAME,
+  lockFilename: REPORTS_LOCK_FILENAME,
+  logTag: 'reports',
+  initCommitMessage: '[teamai] Initialize reports branch',
+});
+
+export type EnsureReportsWorktreeOptions = EnsureWorktreeOptions;
+export type ReportsWrite = BranchWrite;
+export type ReportsWriteContext = BranchWriteContext;
+export type ReportsPublishResult = PublishResult;
+
+/** Materialize the reports worktree. See the branch-worktree module. */
+export function ensureReportsWorktree(
+  localConfig: LocalConfig,
+  options: EnsureReportsWorktreeOptions = {},
+): Promise<string> {
+  return reportsBranch.ensure(localConfig, options);
+}
+
+/**
+ * The team's votes dir on the reports checkout, or undefined when the checkout
+ * there belongs to another repository (a git/self mode switch, #808): its votes
+ * are that team's, so nothing may rank or downvote from them. No checkout yet
+ * is fine (a caller finds no file). Probes the checkout, like
+ * indexableLearningsRoots, so only for index builds and explicit commands.
+ */
+export async function indexableVotesDir(localConfig: LocalConfig): Promise<string | undefined> {
+  try {
+    await reportsBranch.checkOwner(localConfig);
+  } catch (e) {
+    if (e instanceof ForeignCheckoutError) return undefined;
+    throw e;
+  }
+  return path.join(reportsBranch.dir(localConfig), 'votes');
+}
+
+/**
+ * Best-effort refresh of the reports worktree from origin; busy when the lock
+ * cannot be taken, and then nothing is checked; failed when the checkout could
+ * not be set up. Throws only CheckoutRefusedError (#808).
+ */
+export function refreshReportsWorktree(
+  localConfig: LocalConfig,
+  options: EnsureReportsWorktreeOptions = {},
+): Promise<RefreshResult> {
+  return reportsBranch.refresh(localConfig, options);
+}
+
+/**
+ * The reports checkout a reader lists from: refreshed and, if missing,
+ * created, without publishing a missing branch. While a write holds the lock,
+ * the local copy as it is: that write may be creating the checkout, so a
+ * reader must not add or remove it (#808). Throws ForeignCheckoutError when
+ * that copy is another repository's.
+ */
+export async function readableReportsWorktree(
+  localConfig: LocalConfig,
+  options: { dryRun?: boolean } = {},
+): Promise<string> {
+  // A dry run reads the local copy as it is: neither refreshed nor created.
+  if (options.dryRun) {
+    await reportsBranch.checkOwner(localConfig);
+    return reportsBranch.dir(localConfig);
+  }
+  let refreshed = await reportsBranch.refresh(localConfig, { pushIfCreated: false });
+  // Failed: try once more, under the lock like every creation, and throw the
+  // cause if it fails again. An `ensure` here would create the checkout without
+  // the lock, while a writer that took it meanwhile creates it too (#823 item 15).
+  if (refreshed.status === 'failed') refreshed = await reportsBranch.refresh(localConfig, { pushIfCreated: false });
+  switch (refreshed.status) {
+    case 'done':
+      return reportsBranch.dir(localConfig);
+    case 'busy':
+      await reportsBranch.checkOwner(localConfig);
+      return reportsBranch.dir(localConfig);
+    case 'failed':
+      throw new Error(refreshed.reason);
+    default: {
+      const unhandled: never = refreshed;
+      throw new Error(`Unhandled refresh result: ${JSON.stringify(unhandled)}`);
+    }
+  }
+}
+
+/**
+ * Commit files already written into the reports worktree and push them.
+ *
+ * Reports are regenerated on the next session, so callers only need to know
+ * whether the write landed: anything else (a busy lock, an unchanged tree, a
+ * rejected push) is a false they retry by simply reporting again later.
+ */
+export async function commitAndPushReports(
+  localConfig: LocalConfig,
+  message: string,
+  files: string[],
+  options: { pushIfUnchanged?: boolean } = {},
+): Promise<boolean> {
+  return isPublished(await reportsBranch.commitAndPush(localConfig, message, files, options));
+}
+
+/**
+ * A file's content at the reports branch's remote-tracking ref, or null when
+ * the branch (or that file) is not on origin yet.
+ *
+ * A writer calls this inside its `updateReports` write callback: `syncWorktree`
+ * has just fetched the ref by then, so the content is the last state origin
+ * confirmed — the correct merge base for a retry-safe write (#1027), unlike
+ * the worktree copy, which may already hold this machine's own
+ * merged-but-unpushed result.
+ */
+export async function readReportsOriginFile(
+  worktree: string,
+  relPath: string,
+): Promise<string | null> {
+  try {
+    const git = createGit(worktree);
+    return await git.raw(['show', `origin/${REPORTS_BRANCH}:${relPath}`]);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Under the reports lock: sync with origin, run `write`, commit, push.
+ *
+ * Returns the full publish outcome, so a caller that holds the only durable
+ * copy of what it wrote can drop it exactly on delivery (`isDelivered`) and
+ * keep it on `busy`/`failed` (#1027); callers that only need "did the write
+ * land" wrap with `isPublished`, as before.
+ */
+export async function updateReports(
+  localConfig: LocalConfig,
+  write: (worktree: string, ctx: ReportsWriteContext) => Promise<ReportsWrite | null>,
+  options: { pushIfUnchanged?: boolean } = {},
+): Promise<PublishResult> {
+  return reportsBranch.update(localConfig, write, options);
+}
 
 /**
  * Thrown when a knowledge worktree is requested but the business repo has no
@@ -50,542 +186,6 @@ export class EmptyRepoError extends Error {
     );
     this.name = 'EmptyRepoError';
   }
-}
-
-/** Resolve the business repo git root for a self-mode config. */
-function businessRoot(localConfig: LocalConfig): string {
-  return localConfig.repo.businessRepoRoot ?? path.dirname(localConfig.repo.localPath);
-}
-
-/**
- * Git repository that owns the reports worktree.
- * - self: the business repo (knowledge lives in `.teamai/` inside it)
- * - git: the dedicated team clone (`localPath` itself)
- */
-function reportsGitRoot(localConfig: LocalConfig): string {
-  if (isSelfMode(localConfig)) {
-    return businessRoot(localConfig);
-  }
-  return localConfig.repo.localPath;
-}
-
-/** Path to the reports worktree directory (see getReportsDir). */
-function reportsWorktreePath(localConfig: LocalConfig): string {
-  return getReportsDir(localConfig);
-}
-
-/** Lock file sitting beside the reports worktree (never inside the clone). */
-function reportsLockPath(localConfig: LocalConfig): string {
-  return path.join(path.dirname(getReportsDir(localConfig)), REPORTS_LOCK_FILENAME);
-}
-
-/** Whether the remote already has the reports branch. */
-async function remoteBranchExists(repoRoot: string): Promise<boolean> {
-  const git = createGit(repoRoot);
-  try {
-    const res = await git.listRemote(['--heads', 'origin', REPORTS_BRANCH]);
-    return typeof res === 'string' && res.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Ensure a git worktree checked out on the `teamai-reports` orphan branch exists.
- * Self: <knowledgeDir>/reports-wt. Independent git: sibling of the clone.
- * Idempotent. Returns the worktree absolute path.
- *
- * Cold-start cases handled:
- *  - worktree already present  → return it (readers refresh it via refreshReportsWorktree).
- *  - remote branch exists      → worktree add --track -b from origin/teamai-reports.
- *  - remote branch absent      → reuse an unpublished local branch, or create the
- *                                orphan branch locally; then first-push unless
- *                                `pushIfCreated` is false.
- */
-export interface EnsureReportsWorktreeOptions {
-  /**
-   * Whether a cold start may publish a newly created reports branch. Writers
-   * keep the default; read-only callers must pass false so they materialize a
-   * local view without changing origin.
-   */
-  pushIfCreated?: boolean;
-}
-
-export async function ensureReportsWorktree(
-  localConfig: LocalConfig,
-  options: EnsureReportsWorktreeOptions = {},
-): Promise<string> {
-  if (!usesReportsBranch(localConfig)) {
-    return getReportsDir(localConfig);
-  }
-
-  const wt = reportsWorktreePath(localConfig);
-  const repoRoot = reportsGitRoot(localConfig);
-
-  if (!isSelfMode(localConfig) && !(await isDedicatedRepoRoot(repoRoot))) {
-    throw new Error(
-      `Refusing to create a reports worktree: ${repoRoot} is not a dedicated team-repo clone root`,
-    );
-  }
-
-  // Already a valid worktree — nothing to do. `isGitRepo` only checks that a
-  // `.git` file/dir exists; after a sibling clone is deleted and re-cloned the
-  // worktree gitdir (`<clone>/.git/worktrees/reports-wt`) is gone and git ops
-  // fail with "not a git repository". Probe a real git command and fall through
-  // to remove+recreate when the link is stale.
-  if (await isGitRepo(wt)) {
-    try {
-      await createGit(wt).revparse(['--is-inside-work-tree']);
-      return wt;
-    } catch {
-      // stale/dangling worktree link (clone was re-cloned/pruned) — recreate below.
-    }
-  }
-
-  // Path exists but is not a git worktree (stale/partial) — clear it so we can recreate.
-  if (await pathExists(wt)) {
-    await fse.remove(wt);
-  }
-
-  await ensureDir(path.dirname(wt));
-  const git = createGit(repoRoot);
-
-  // Prune any dangling worktree registration left from a previous removal.
-  try {
-    await git.raw(['worktree', 'prune']);
-  } catch {
-    // best effort
-  }
-
-  if (await remoteBranchExists(repoRoot)) {
-    // Remote branch exists: fetch and check it out into the worktree.
-    try {
-      await git.fetch(['origin', REPORTS_BRANCH]);
-    } catch {
-      // fetch may fail offline; worktree add can still work if we have it locally
-    }
-    // If a local branch of the same name exists, add tracking it; otherwise create tracking branch.
-    const branches = await git.branchLocal();
-    if (branches.all.includes(REPORTS_BRANCH)) {
-      await git.raw(['worktree', 'add', wt, REPORTS_BRANCH]);
-    } else {
-      await git.raw(['worktree', 'add', wt, '--track', '-b', REPORTS_BRANCH, `origin/${REPORTS_BRANCH}`]);
-    }
-  } else {
-    // Remote branch absent. A read-only cold start (or a failed first push)
-    // leaves an unpublished local branch; reuse it, because creating the orphan
-    // branch again fails with "a branch named 'teamai-reports' already exists".
-    const branches = await git.branchLocal();
-    if (branches.all.includes(REPORTS_BRANCH)) {
-      await git.raw(['worktree', 'add', wt, REPORTS_BRANCH]);
-    } else {
-      await createOrphanWorktree(repoRoot, wt);
-      await writeWorktreeGitignore(wt);
-      const wtGit = createGit(wt);
-      await wtGit.add(['.gitignore']);
-      await commitSkippingHooks(wtGit, '[teamai] Initialize reports branch');
-    }
-    if (options.pushIfCreated !== false) {
-      try {
-        await createGit(wt).push(['-u', 'origin', REPORTS_BRANCH]);
-      } catch (e) {
-        log.debug(`[reports] initial push skipped: ${(e as Error).message}`);
-      }
-    }
-  }
-
-  return wt;
-}
-
-/**
- * Create an orphan-branch worktree. Uses the modern `--orphan` flag (git 2.42+)
- * and falls back to the detach + `checkout --orphan` dance for older git.
- */
-async function createOrphanWorktree(repoRoot: string, wt: string): Promise<void> {
-  const git = createGit(repoRoot);
-  try {
-    // git 2.42+: create a worktree on a fresh orphan branch directly.
-    // The branch name must be given via -b; a positional after <path> is treated
-    // as a commit-ish and errors ("--orphan and commit-ish cannot be used together").
-    await git.raw(['worktree', 'add', '--orphan', '-b', REPORTS_BRANCH, wt]);
-    // The --orphan worktree may inherit the index/files from HEAD in some git
-    // versions; clear tracked entries so the branch starts empty.
-    const wtGit = createGit(wt);
-    try {
-      await wtGit.raw(['rm', '-rf', '--cached', '.']);
-    } catch {
-      // nothing staged — fine
-    }
-    await clearWorktreeFiles(wt);
-  } catch {
-    // Older git (<2.42): detach a worktree at HEAD, then orphan-checkout inside it.
-    await git.raw(['worktree', 'add', '--detach', wt, 'HEAD']);
-    const wtGit = createGit(wt);
-    await wtGit.raw(['checkout', '--orphan', REPORTS_BRANCH]);
-    try {
-      await wtGit.raw(['rm', '-rf', '--cached', '.']);
-    } catch {
-      // nothing staged
-    }
-    await clearWorktreeFiles(wt);
-  }
-}
-
-/** Remove all files (except .git) from a freshly-created orphan worktree. */
-async function clearWorktreeFiles(wt: string): Promise<void> {
-  const entries = await fse.readdir(wt);
-  await Promise.all(
-    entries
-      .filter((e) => e !== '.git')
-      .map((e) => fse.remove(path.join(wt, e))),
-  );
-}
-
-/** Write a .gitignore inside the reports worktree to prevent nested-worktree recursion. */
-async function writeWorktreeGitignore(wt: string): Promise<void> {
-  const content = [
-    '# teamai reports branch — machine-local artifacts should never be tracked here',
-    `${REPORTS_WORKTREE_DIRNAME}/`,
-    'knowledge-wt/',
-    '',
-  ].join('\n');
-  await writeFile(path.join(wt, '.gitignore'), content);
-}
-
-const MAX_PUSH_RETRIES = 5;
-
-export interface ReportsWrite {
-  files: string[];
-  message: string;
-}
-
-/** Commit `files` in an already-locked reports worktree and push them. */
-async function commitAndPushReportsAt(
-  wt: string,
-  message: string,
-  files: string[],
-  options: { pushIfUnchanged?: boolean } = {},
-): Promise<boolean> {
-  const git = createGit(wt);
-
-  await git.add(files);
-  const status = await git.status();
-  if (status.staged.length === 0 && !options.pushIfUnchanged) {
-    log.debug('[reports] nothing to commit');
-    return false;
-  }
-
-  // A report retry may reconstruct the same tree as a previously committed
-  // but unconfirmed push. It still needs a push, without an empty commit.
-  if (status.staged.length > 0) await commitSkippingHooks(git, message);
-
-  // Push with fetch+rebase retry. Each member only writes <user>.yaml, so
-  // rebase conflicts are effectively impossible; retries handle the pure
-  // non-fast-forward race.
-  for (let attempt = 1; attempt <= MAX_PUSH_RETRIES; attempt++) {
-    try {
-      await git.push(['origin', REPORTS_BRANCH]);
-      return true;
-    } catch (pushErr) {
-      if (attempt === MAX_PUSH_RETRIES) {
-        log.debug(`[reports] push failed after ${attempt} attempts: ${(pushErr as Error).message}`);
-        return false;
-      }
-      try {
-        await git.fetch(['origin', REPORTS_BRANCH]);
-        await git.rebase([`origin/${REPORTS_BRANCH}`]);
-      } catch (rebaseErr) {
-        log.debug(`[reports] rebase failed, retrying: ${(rebaseErr as Error).message}`);
-        // Abort a half-finished rebase so the next attempt starts clean.
-        try {
-          await git.rebase(['--abort']);
-        } catch {
-          // no rebase in progress
-        }
-      }
-    }
-  }
-  return false;
-}
-
-/**
- * Commit the given files (relative to the reports worktree) to the reports orphan
- * branch and push, retrying with fetch + rebase on non-fast-forward races.
- *
- * Callers write their files into getReportsDir(localConfig)/<...> (which is the
- * worktree) BEFORE calling this. Best-effort: logs and returns false on failure
- * rather than throwing, matching the existing pushRepoDirectly contract.
- *
- * Merge-writers (session / votes / stats / member roster) should use
- * {@link updateReports} so the worktree is synced with origin before the write.
- *
- * @returns true if something was committed & pushed, false if nothing to do or on failure.
- */
-export async function commitAndPushReports(
-  localConfig: LocalConfig,
-  message: string,
-  files: string[],
-  options: { pushIfUnchanged?: boolean } = {},
-): Promise<boolean> {
-  const lockPath = reportsLockPath(localConfig);
-  const locked = await acquireLock(lockPath);
-  if (!locked) {
-    log.debug('[reports] another reports write is in progress; skipping');
-    return false;
-  }
-
-  try {
-    const wt = await ensureReportsWorktree(localConfig);
-    return await commitAndPushReportsAt(wt, message, files, options);
-  } catch (e) {
-    log.debug(`[reports] commitAndPushReports failed (non-blocking): ${(e as Error).message}`);
-    return false;
-  } finally {
-    await releaseLock(lockPath);
-  }
-}
-
-/**
- * Under the reports lock: sync the worktree with origin, run `write`, commit, push.
- * The callback does not run when the lock is busy.
- *
- * @returns true if something was committed and pushed. false when the lock was
- *   busy, `write` returned null, or commit/push failed.
- */
-export async function updateReports(
-  localConfig: LocalConfig,
-  write: (worktree: string) => Promise<ReportsWrite | null>,
-  options: { pushIfUnchanged?: boolean } = {},
-): Promise<boolean> {
-  if (!usesReportsBranch(localConfig)) {
-    throw new Error('updateReports requires a repo that stores reports on the teamai-reports branch');
-  }
-
-  const lockPath = reportsLockPath(localConfig);
-  if (!(await acquireLock(lockPath))) {
-    log.debug('[reports] another reports write is in progress; skipping');
-    return false;
-  }
-
-  try {
-    const wt = await ensureReportsWorktree(localConfig);
-    try {
-      await syncReportsWorktree(wt);
-    } catch (e) {
-      log.debug(`[reports] sync before write failed, writing onto the local copy: ${(e as Error).message}`);
-    }
-
-    const change = await write(wt);
-    if (!change || change.files.length === 0) {
-      return false;
-    }
-    return await commitAndPushReportsAt(wt, change.message, change.files, options);
-  } catch (e) {
-    log.debug(`[reports] updateReports failed (non-blocking): ${(e as Error).message}`);
-    return false;
-  } finally {
-    await releaseLock(lockPath);
-  }
-}
-
-async function gitPathExists(git: SimpleGit, gitPath: string): Promise<boolean> {
-  try {
-    const resolved = (await git.raw(['rev-parse', '--git-path', gitPath])).trim();
-    return resolved.length > 0 && (await pathExists(resolved));
-  } catch {
-    return false;
-  }
-}
-
-/** True while `git rebase` has not finished (as opposed to a completed rebase whose autostash conflicted). */
-async function rebaseInProgress(git: SimpleGit): Promise<boolean> {
-  return (await gitPathExists(git, 'rebase-merge')) || (await gitPathExists(git, 'rebase-apply'));
-}
-
-/**
- * Restore the "Stashed changes" / `--theirs` side of a stash-apply conflict
- * and leave it uncommitted. Does not read or drop `refs/stash`: worktrees of
- * the same repo share that ref, so a reports refresh must never clean it up.
- * Skip when a rebase is still in progress so a real commit conflict is
- * aborted by the caller instead.
- */
-async function restoreConflictedFiles(git: SimpleGit): Promise<void> {
-  let conflicted: string[] = [];
-  try {
-    conflicted = (await git.status()).conflicted ?? [];
-  } catch {
-    return;
-  }
-  if (conflicted.length === 0) {
-    return;
-  }
-  if (await rebaseInProgress(git)) {
-    return;
-  }
-
-  try {
-    await git.raw(['checkout', '--theirs', '--', ...conflicted]);
-    await git.raw(['add', '--', ...conflicted]);
-    await git.raw(['reset', 'HEAD', '--', ...conflicted]);
-    log.debug('[reports] restored uncommitted report files after a stash-apply conflict; using the local copy');
-  } catch (e) {
-    log.debug(`[reports] could not restore stash-apply conflicts: ${(e as Error).message}`);
-    try {
-      await git.raw(['reset', '--hard', 'HEAD']);
-    } catch {
-      // best effort: at least try not to leave conflict markers
-    }
-  }
-}
-
-/**
- * Snapshot dirty tracked files without touching `refs/stash` (`git stash create`
- * returns a dangling commit). `git rebase --autostash` would push onto the
- * shared stash list, which other worktrees of this repo also see.
- */
-async function snapshotDirtyTree(git: SimpleGit): Promise<string | null> {
-  try {
-    const sha = (await git.raw(['stash', 'create'])).trim();
-    return sha.length > 0 ? sha : null;
-  } catch {
-    return null;
-  }
-}
-
-async function applyDirtySnapshot(git: SimpleGit, sha: string): Promise<void> {
-  try {
-    await git.raw(['stash', 'apply', sha]);
-  } catch {
-    // apply conflicts leave UU paths; restoreConflictedFiles recovers them
-  }
-  await restoreConflictedFiles(git);
-}
-
-/**
- * Bring the reports worktree up to date with origin. The caller holds the
- * reports lock, so no commitAndPushReports runs at the same time.
- *
- *  - fetch fails (offline, or origin has no reports branch yet) → keep the local copy.
- *  - no unpushed commits → fast-forward to origin.
- *  - unpushed commits (e.g. a push that failed offline) → rebase them onto origin
- *    so the next push delivers them.
- *  - uncommitted report files (a writer wrote them but has not committed yet)
- *    are carried along, never discarded; if they block the update, keep the
- *    local copy.
- *  - unpushed commits that conflict with origin (the same member reported from
- *    another checkout) → dropped, so the worktree is not left diverged forever.
- *  - dirty + ahead: snapshot with `git stash create` (not `--autostash`), rebase,
- *    then re-apply. That object is never stored in `refs/stash`, so a concurrent
- *    `git stash` in another worktree of this repo is left alone. Stash-apply
- *    conflicts restore the original uncommitted files, never conflict markers.
- */
-async function syncReportsWorktree(wt: string): Promise<void> {
-  const git = createGit(wt);
-  const upstream = `origin/${REPORTS_BRANCH}`;
-  try {
-    await git.fetch(['origin', REPORTS_BRANCH]);
-  } catch (e) {
-    log.debug(`[reports] fetch failed, using the local copy: ${(e as Error).message}`);
-    return;
-  }
-
-  await restoreConflictedFiles(git);
-
-  const dirty = !(await git.status()).isClean();
-  const ahead = Number.parseInt((await git.raw(['rev-list', '--count', `${upstream}..HEAD`])).trim(), 10);
-
-  let carried: string | null = null;
-  if (dirty && ahead > 0) {
-    carried = await snapshotDirtyTree(git);
-    if (!carried) {
-      log.debug('[reports] uncommitted report files block the refresh; using the local copy');
-      return;
-    }
-    try {
-      await git.raw(['reset', '--hard', 'HEAD']);
-    } catch (e) {
-      log.debug(`[reports] could not clear the worktree for rebase; using the local copy: ${(e as Error).message}`);
-      await applyDirtySnapshot(git, carried);
-      return;
-    }
-  }
-
-  try {
-    if (ahead > 0) {
-      await git.rebase([upstream]);
-    } else {
-      await git.raw(['merge', '--ff-only', upstream]);
-    }
-  } catch (e) {
-    if (ahead > 0) {
-      try {
-        await git.rebase(['--abort']);
-      } catch {
-        // no rebase in progress
-      }
-    }
-    if (carried) {
-      await applyDirtySnapshot(git, carried);
-      log.debug(`[reports] uncommitted report files block the refresh; using the local copy: ${(e as Error).message}`);
-      return;
-    }
-    if (dirty) {
-      log.debug(`[reports] uncommitted report files block the refresh; using the local copy: ${(e as Error).message}`);
-      return;
-    }
-    log.debug(`[reports] dropping ${ahead} unpushed report commit(s) that conflict with ${upstream}: ${(e as Error).message}`);
-    await git.raw(['reset', '--hard', upstream]);
-    return;
-  }
-
-  if (carried) {
-    await applyDirtySnapshot(git, carried);
-  }
-}
-
-/**
- * Best-effort refresh of the reports worktree from origin so readers (pull's
- * search index and recommendations, members, digest, maintenance) see other
- * members' latest data. Read-only callers pass `pushIfCreated: false`. When a
- * report write holds the lock, the local copy is used as-is. Never throws.
- * Safe: only touches the orphan-branch worktree, never the active tree.
- */
-export async function refreshReportsWorktree(
-  localConfig: LocalConfig,
-  options: EnsureReportsWorktreeOptions = {},
-): Promise<void> {
-  if (!usesReportsBranch(localConfig)) {
-    return;
-  }
-
-  const lockPath = reportsLockPath(localConfig);
-  let locked = false;
-  try {
-    locked = await acquireLock(lockPath);
-    const wt = await ensureReportsWorktree(localConfig, options);
-    if (!locked) {
-      log.debug('[reports] a reports write is in progress; reading the local copy');
-      return;
-    }
-    await syncReportsWorktree(wt);
-  } catch (e) {
-    log.debug(`[reports] refresh skipped: ${(e as Error).message}`);
-  } finally {
-    if (locked) {
-      await releaseLock(lockPath);
-    }
-  }
-}
-
-/**
- * Ensure the reports directory exists and return it. For non-HTTP repos this
- * creates the reports worktree first; HTTP keeps reports alongside knowledge.
- */
-export async function ensureReportsDir(localConfig: LocalConfig): Promise<string> {
-  if (usesReportsBranch(localConfig)) {
-    return ensureReportsWorktree(localConfig);
-  }
-  return getReportsDir(localConfig);
 }
 
 /**
@@ -604,7 +204,7 @@ export async function withKnowledgeWorktree<T>(
   localConfig: LocalConfig,
   fn: (worktreeConfig: LocalConfig) => Promise<T>,
 ): Promise<T> {
-  const repoRoot = businessRoot(localConfig);
+  const repoRoot = getBusinessRoot(localConfig);
   const wt = path.join(localConfig.repo.localPath, KNOWLEDGE_WORKTREE_DIRNAME);
   const git = createGit(repoRoot);
 
@@ -667,5 +267,107 @@ export async function withKnowledgeWorktree<T>(
       await fse.remove(wt);
       try { await git.raw(['worktree', 'prune']); } catch { /* best effort */ }
     }
+  }
+}
+
+/** A failed refresh, distinct from errors while reading the preview checkout. */
+export class PreviewFetchError extends Error {
+  constructor(cause: unknown) {
+    super((cause as Error).message, { cause });
+    this.name = 'PreviewFetchError';
+  }
+}
+
+/** A clone's dirty files may survive a real pull but are absent from origin. */
+export class DirtyPreviewError extends Error {
+  constructor(repoRoot: string) {
+    super(`Cannot preview a team repo with uncommitted changes at ${repoRoot}. Commit or stash the changes, then retry --dry-run. Nothing was changed.`);
+    this.name = 'DirtyPreviewError';
+  }
+}
+
+/**
+ * Run `fn` against a throwaway checkout of the post-pull clone branch, or
+ * origin/<default> in self mode, without changing the member checkout.
+ *
+ * Only a fetch touches the member's repo. Pulling there can reset a clone
+ * that diverged from origin and discard its commits, and `withKnowledgeWorktree`
+ * adds a worktree (#900). The checkout is a `--shared` clone in the OS temp
+ * dir, so history reads work and nothing is written under the repo. `fn`
+ * receives a clone of localConfig pointed at it, laid out as the real run's.
+ */
+export async function withDefaultBranchPreview<T>(
+  localConfig: LocalConfig,
+  fn: (previewConfig: LocalConfig) => Promise<T>,
+  options: { allowStale?: boolean } = {},
+): Promise<T> {
+  const selfMode = localConfig.repo.kind === 'self';
+  const repoRoot = selfMode ? getBusinessRoot(localConfig) : localConfig.repo.localPath;
+  const git = createGit(repoRoot);
+  // A successful clone pull may preserve dirty manifests/resources. Do not
+  // silently replace that view with origin; self mode really reads a worktree.
+  if (!selfMode && (await git.raw(['--no-optional-locks', 'status', '--porcelain', '--untracked-files=all'])).trim()) {
+    throw new DirtyPreviewError(repoRoot);
+  }
+  const defaultBranch = await getDefaultBranch(repoRoot);
+  const branch = selfMode ? defaultBranch : (await git.revparse(['--abbrev-ref', 'HEAD'])).trim();
+  const head = await getHeadCommit(repoRoot);
+  let base: string | null = null;
+  try {
+    if (selfMode) {
+      await git.fetch(['origin', branch]);
+      base = await getHeadCommit(repoRoot, `origin/${branch}`) ?? head;
+    } else {
+      // pullRepo first pulls the configured upstream. FETCH_HEAD also works
+      // when the remote or its branch has a different name from origin/local.
+      try {
+        const remote = (await git.getConfig(`branch.${branch}.remote`)).value;
+        const merge = (await git.getConfig(`branch.${branch}.merge`)).value;
+        if (remote && merge) {
+          await git.fetch([remote, merge]);
+          const upstream = await getHeadCommit(repoRoot, 'FETCH_HEAD');
+          if (head && upstream) {
+            const common = (await git.raw(['merge-base', head, upstream])).trim();
+            if (common === upstream) base = head;
+            else if (common === head) base = upstream;
+          }
+        }
+      } catch { /* failed ff-only pull: model pullRepo's origin/local fallback */ }
+      if (!base) {
+        await git.fetch(['origin', branch]);
+        base = await getHeadCommit(repoRoot, `origin/${branch}`);
+        if (!base) throw new Error(`Cannot resolve origin/${branch} after fetching; the pull reset would fail.`);
+      }
+    }
+  } catch (e) {
+    if (!options.allowStale) throw new PreviewFetchError(e);
+    log.warn(`Could not fetch origin/${branch} (${(e as Error).message}); ${selfMode ? 'previewing against the copy fetched last.' : 'previewing against the local checkout.'}`);
+    base = selfMode ? await getHeadCommit(repoRoot, `origin/${branch}`) ?? head : head;
+  }
+  if (!base) throw new EmptyRepoError(repoRoot);
+
+  const dir = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-preview-'));
+  try {
+    await git.raw(['clone', '--quiet', '--shared', '--no-checkout', repoRoot, dir]);
+    const preview = createGit(dir);
+    await preview.raw(['checkout', '--quiet', '--detach', base]);
+    // A shared clone's origin/* initially name the member's local branches.
+    // History/name resolution must instead see the member's fetched refs,
+    // including an ahead HEAD that differs from origin/<active branch>.
+    const refs = await git.raw(['for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/origin/']);
+    for (const entry of refs.trim().split('\n').filter(Boolean)) {
+      const [ref, commit] = entry.split(' ');
+      if (ref !== 'refs/remotes/origin/HEAD') await preview.raw(['update-ref', ref, commit]);
+    }
+    await preview.raw(['symbolic-ref', 'refs/remotes/origin/HEAD', `refs/remotes/origin/${defaultBranch}`]);
+    const previewConfig: LocalConfig = {
+      ...localConfig,
+      repo: selfMode
+        ? { ...localConfig.repo, localPath: path.join(dir, '.teamai'), businessRepoRoot: dir }
+        : { ...localConfig.repo, localPath: dir },
+    };
+    return await fn(previewConfig);
+  } finally {
+    await fse.remove(dir);
   }
 }

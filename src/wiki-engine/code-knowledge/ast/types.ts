@@ -28,6 +28,38 @@ export interface AstCallSite {
   line: number;
   calleeText: string;
   receiver?: string;
+  /**
+   * Swift only. The names that could bind this call's callee (or receiver),
+   * gathered from the top-level declaration that encloses the call site:
+   * function and closure parameters, local `let`/`var`, and whatever a
+   * `for` / `if let` / `guard let` / `catch let` / `case let` introduces, plus
+   * stored properties, generic parameters and closure capture lists.
+   *
+   * A call whose callee (or receiver) is one of these names refers to that
+   * binding, so a module-wide lookup must not claim it: `run(work:) { work() }`
+   * calls the parameter, not a sibling file's `func work()`. Only the syntax
+   * tree knows this, which is why it is recorded here and not recomputed in the
+   * resolver.
+   *
+   * Collected per declaration rather than per call site: the declaration is read
+   * whole, and what it yields is the names the declaration *binds* — the
+   * positions the grammar marks as introductions. A name that merely occurs in
+   * the declaration, such as one passed as an argument or used as an
+   * initializer, is a use and does not count. Both directions of error are not
+   * equal here: an extra name costs a resolution, a missing one invents a
+   * cross-file edge. Absent for non-Swift files and for sites with no such
+   * binding.
+   */
+  localBindings?: string[];
+  /**
+   * Swift only. Whether the call sits lexically inside the body of a type.
+   *
+   * Only such a call can be meaning a member: an unqualified `work()` is read as
+   * `self.work()` inside a type and as the module-level `work` outside one, so
+   * the member-name veto in the resolver has to know which of the two it has in
+   * front of it. Absent for non-Swift files and for a call no type encloses.
+   */
+  enclosedByType?: boolean;
   resolvedTargetId?: string;
   resolvedTargetFile?: string;
   confidence: ManifestConfidence;

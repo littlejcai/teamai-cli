@@ -148,7 +148,7 @@ export async function lintTeamwiki(opts: {
             severity: 'medium',
             category: 'stale-manifest',
             location: 'teamwiki/source-manifest.json',
-            message: `上次扫描距今 ${Math.floor(daysSince)} 天，建议重新执行 --extract`,
+            message: `Last scan was ${Math.floor(daysSince)} days ago; refresh it with \`teamai import --incremental\``,
           });
         }
       }
@@ -165,7 +165,6 @@ export async function lintTeamwiki(opts: {
   // Graph health metrics
   let graphHealth = { nodeCount: 0, edgeCount: 0, orphanNodes: 0, connectivity: 0 };
   if (graph) {
-    const nodeSlugs = new Set(graph.nodes.map(n => n.slug));
     const connectedNodes = new Set<string>();
     for (const edge of graph.edges) {
       connectedNodes.add(edge.from);

@@ -153,8 +153,11 @@ export class GitCodeRepoNotFoundError extends Error {
  * basic-auth so the credential PERSISTS to `.git/config` and later `git push`
  * (branch + PR flow) authenticates without a separate credential helper.
  *
- * This mirrors the GitHub (`x-access-token:<token>@`) and TGit (`oauth2:<token>@`)
- * providers. GitCode's git-over-HTTPS endpoint accepts Basic `oauth2:<token>`
+ * This mirrors the TGit (`oauth2:<token>@`) provider. GitHub used to embed the
+ * token the same way, but #978 replaced that with a one-shot `http.extraHeader`
+ * plus a URL-scoped `credential.helper`, so no token reaches `.git/config`
+ * there any more.
+ * GitCode's git-over-HTTPS endpoint accepts Basic `oauth2:<token>`
  * but REJECTS `Authorization: Bearer` (verified live) — so an in-URL credential,
  * not a Bearer header, is required. The token lives only in the private team-repo
  * clone under ~/.teamai/team-repo.
@@ -181,6 +184,7 @@ export function gitcodeRepoClone(repo: string, localPath: string): void {
     encoding: 'utf-8',
     stdio: ['pipe', 'pipe', 'pipe'],
     timeout: 120_000,
+    windowsHide: true,
   });
   const allOutput = `${result.stderr ?? ''} ${result.stdout ?? ''}`;
   if (result.status === 0) return;

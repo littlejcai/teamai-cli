@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach, type Mock, type MockInstance } from 'vitest';
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach, type Mock, type MockInstance } from 'vitest';
 
 // ─── Mocks ──────────────────────────────────────────────
 
@@ -34,10 +34,12 @@ vi.mock('fs-extra', () => ({
     remove: vi.fn(),
     ensureDir: vi.fn(),
     rename: vi.fn(),
+    link: vi.fn(),
   },
 }));
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   loadState: vi.fn(),
   saveState: vi.fn(),
   loadLocalConfig: vi.fn(),
@@ -52,6 +54,7 @@ vi.mock('../utils/logger.js', () => ({
     error: vi.fn(),
     debug: vi.fn(),
     dim: vi.fn(),
+    persist: vi.fn(),
   },
 }));
 
@@ -70,6 +73,9 @@ vi.mock('../builtin-hooks.js', () => ({
 
 let readlineAnswer = 'n';
 vi.mock('../utils/prompt.js', () => ({
+  // Mirror the real predicate's TTY leg so tests that force `isTTY` keep
+  // driving the interactive branch, independent of CI=true on the runner.
+  isInteractive: () => Boolean(process.stdin.isTTY),
   askQuestion: vi.fn((_prompt: string, defaultValue?: string) => {
     return Promise.resolve(readlineAnswer || defaultValue || '');
   }),
@@ -85,12 +91,15 @@ vi.mock('../utils/prompt.js', () => ({
 
 import fse from 'fs-extra';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { loadState, saveState, loadLocalConfig, loadTeamConfig } from '../config.js';
 import { log } from '../utils/logger.js';
+import { askConfirmation } from '../utils/prompt.js';
 
 import {
   getCurrentVersion,
+  getCurrentPackageName,
   compareVersions,
   isCacheValid,
   acquireLock,
@@ -117,6 +126,7 @@ const mockedFse = fse as unknown as {
   remove: Mock;
   ensureDir: Mock;
   rename: Mock;
+  link: Mock;
 };
 const mockedLog = log as unknown as {
   info: Mock;
@@ -125,6 +135,7 @@ const mockedLog = log as unknown as {
   error: Mock;
   debug: Mock;
   dim: Mock;
+  persist: Mock;
 };
 
 // ─── Test setup ─────────────────────────────────────────
@@ -139,9 +150,24 @@ const defaultState = {
   availableUpdate: null,
 };
 
+// A real npm-managed global layout (<prefix>/lib/node_modules/<pkg>) so doUpdate
+// has an install target. Without one — as when the suite runs from this
+// checkout — doUpdate refuses to install (see the linked-checkout test).
+let globalPrefix: string;
+beforeAll(() => {
+  globalPrefix = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-update-prefix-'));
+  fs.mkdirSync(path.join(globalPrefix, 'lib', 'node_modules', getCurrentPackageName()), { recursive: true });
+});
+afterAll(() => {
+  fs.rmSync(globalPrefix, { recursive: true, force: true });
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   readlineAnswer = 'n';
+  fileURLToPathMock.mockReturnValue(
+    path.join(globalPrefix, 'lib', 'node_modules', getCurrentPackageName(), 'dist', 'index.js'),
+  );
   mockedLoadState.mockResolvedValue({ ...defaultState });
   mockedSaveState.mockResolvedValue(undefined);
   mockedLoadLocalConfig.mockResolvedValue({
@@ -153,6 +179,7 @@ beforeEach(() => {
   mockedFse.pathExists.mockResolvedValue(false);
   mockedFse.readFile.mockResolvedValue('');
   mockedFse.writeFile.mockResolvedValue(undefined);
+  mockedFse.link.mockResolvedValue(undefined);
   mockedFse.remove.mockResolvedValue(undefined);
   mockedFse.rename.mockResolvedValue(undefined);
 });
@@ -237,6 +264,21 @@ describe('checkForUpdate', () => {
 
     expect(result.available).toBe(true);
     expect(result.latest).toBe('99.0.0');
+    expect(mockedExecSync).not.toHaveBeenCalled();
+  });
+
+  it('should skip npm view when cache is valid and no update was available', async () => {
+    const recentCheck = new Date(Date.now() - 1000).toISOString();
+    mockedLoadState.mockResolvedValue({
+      ...defaultState,
+      lastUpdateCheck: recentCheck,
+      availableUpdate: null, // no update last time — the common case
+    });
+
+    const result = await checkForUpdate();
+
+    expect(result.available).toBe(false);
+    expect(result.current).toBe(result.latest);
     expect(mockedExecSync).not.toHaveBeenCalled();
   });
 
@@ -479,10 +521,10 @@ describe('doUpdate', () => {
 
     await doUpdate();
 
-    expect(mockedFse.writeFile).toHaveBeenCalledWith(
+    // Created by hard-linking a fully written temp file onto the lock name.
+    expect(mockedFse.link).toHaveBeenCalledWith(
       expect.stringContaining('update-lock'),
-      expect.any(String),
-      { flag: 'wx' },
+      expect.stringMatching(/update-lock$/),
     );
     expect(mockedLog.success).toHaveBeenCalled();
     expect(mockedFse.remove).toHaveBeenCalledWith(
@@ -497,7 +539,7 @@ describe('doUpdate', () => {
     // so acquireLock backs off rather than reclaiming.
     const eexist = new Error('EEXIST') as NodeJS.ErrnoException;
     eexist.code = 'EEXIST';
-    mockedFse.writeFile.mockRejectedValue(eexist);
+    mockedFse.link.mockRejectedValue(eexist);
     mockedFse.readFile.mockResolvedValue(
       JSON.stringify({ pid: process.pid, owner: 'held', startedAt: 'x' }),
     );
@@ -586,6 +628,32 @@ describe('checkForUpdate with corrupted state', () => {
 // ─── Test: update() entry point ─────────────────────────
 
 describe('update', () => {
+  it.each([{}, { check: true }])('only checks without saving state under --dry-run (%j)', async (options) => {
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+    await update({ ...options, dryRun: true });
+
+    expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('Update available'));
+    expect(mockedExecSync).toHaveBeenCalledTimes(1);
+    expect(mockedExecSync.mock.calls[0][1]).toContain('view');
+    expect(mockedSaveState).not.toHaveBeenCalled();
+    expect(mockedLoadLocalConfig).not.toHaveBeenCalled();
+    expect(mockedFse.writeFile).not.toHaveBeenCalled();
+    expect(mockedFse.link).not.toHaveBeenCalled();
+    expect(mockedLog.success).not.toHaveBeenCalled();
+    expect(askConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('reports the current version without persisting when a dry-run finds no update', async () => {
+    mockedExecSync.mockResolvedValue({ stdout: `${getCurrentVersion()}\n`, stderr: '' });
+
+    await update({ dryRun: true });
+
+    expect(mockedLog.info).toHaveBeenCalledWith(expect.stringContaining('Already up to date'));
+    expect(mockedSaveState).not.toHaveBeenCalled();
+    expect(mockedExecSync).toHaveBeenCalledTimes(1);
+  });
+
   it('should only check and print when --check is set', async () => {
     mockedExecSync.mockResolvedValueOnce({ stdout: '99.0.0\n', stderr: '' });
 
@@ -701,14 +769,15 @@ function eexist(): NodeJS.ErrnoException {
 }
 
 describe('acquireLock', () => {
-  it('acquires via an exclusive (wx) create when no lockfile exists', async () => {
-    mockedFse.writeFile.mockResolvedValue(undefined);
+  it('falls back to an exclusive (wx) create when the lock cannot be hard-linked', async () => {
+    mockedFse.link.mockRejectedValue(Object.assign(new Error('EPERM'), { code: 'EPERM' }));
 
     const result = await acquireLock('/tmp/test-lock');
 
     expect(result).toBe(true);
-    const [pathArg, payloadArg, optsArg] = mockedFse.writeFile.mock.calls[0];
-    expect(pathArg).toBe('/tmp/test-lock');
+    const exclusive = mockedFse.writeFile.mock.calls.find(([p]) => p === '/tmp/test-lock');
+    expect(exclusive).toBeDefined();
+    const [, payloadArg, optsArg] = exclusive ?? [];
     expect(optsArg).toEqual({ flag: 'wx' });
     const parsed = JSON.parse(payloadArg as string);
     expect(parsed.pid).toBe(process.pid);
@@ -718,13 +787,11 @@ describe('acquireLock', () => {
 
   it('reclaims a stale lock via an atomic rename-into-place', async () => {
     // The main lock's exclusive create always finds it present (a stale lock);
-    // the sentinel and temp writes succeed. Reclaim completes by renaming the
-    // fresh payload over the stale file. (Concurrency/atomicity is proven for
-    // real in lock-atomic.test.ts.)
-    mockedFse.writeFile.mockImplementation((p: string, _data: string, opts?: { flag?: string }) => {
-      if (p === '/tmp/test-lock' && opts?.flag === 'wx') return Promise.reject(eexist());
-      return Promise.resolve(undefined);
-    });
+    // the sentinel create and temp writes succeed. Reclaim completes by renaming
+    // the fresh payload over the stale file. (Concurrency/atomicity is proven
+    // for real in lock-atomic.test.ts.)
+    mockedFse.link.mockImplementation((_tmp: string, target: string) =>
+      target === '/tmp/test-lock' ? Promise.reject(eexist()) : Promise.resolve(undefined));
     mockedFse.readFile.mockResolvedValue('99999999'); // dead pid → stale
     mockedFse.rename.mockResolvedValue(undefined);
 
@@ -735,7 +802,8 @@ describe('acquireLock', () => {
   });
 
   it('returns false when a live process holds the lock', async () => {
-    mockedFse.writeFile.mockRejectedValue(eexist());
+    mockedFse.link.mockImplementation((_tmp: string, target: string) =>
+      target === '/tmp/test-lock' ? Promise.reject(eexist()) : Promise.resolve(undefined));
     // Our own PID is alive → process.kill(pid, 0) succeeds → not stale.
     mockedFse.readFile.mockResolvedValue(JSON.stringify({ pid: process.pid, owner: 'x' }));
 
@@ -768,7 +836,7 @@ describe('releaseLock', () => {
 
     await releaseLock('/tmp/taken-lock');
 
-    expect(mockedFse.remove).not.toHaveBeenCalled();
+    expect(mockedFse.remove).not.toHaveBeenCalledWith('/tmp/taken-lock');
   });
 
   it('does NOT delete a lock this process never acquired (no owner token)', async () => {
@@ -941,12 +1009,55 @@ describe('self-update install-target safety', () => {
     // undeclared siblings (including a co-located npm); -g lands in
     // <prefix>/lib. Neither may touch the vendored tree — stay out entirely.
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Self-update is not supported'));
+    // The Stop hook discards stderr; debug.log is where the refusal survives.
+    expect(mockedLog.persist).toHaveBeenCalledWith(expect.stringContaining('Self-update is not supported'));
     expect(mockedExecSync).toHaveBeenCalledTimes(1); // the version check only
     expect(mockedExecSync).not.toHaveBeenCalledWith(
       expect.any(String),
       expect.arrayContaining(['install']),
       expect.anything(),
     );
+  });
+
+  it('refuses to run npm when the running CLI is a linked checkout', async () => {
+    fileURLToPathMock.mockReturnValue(path.join('/home', 'u', 'dev', 'teamai-cli', 'dist', 'index.js'));
+    mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+    await doUpdate();
+
+    // `npm install -g` without a prefix lands in npm's default global prefix,
+    // which is exactly where `npm link` put its symlink — installing would
+    // swap the checkout for the registry copy instead of updating it.
+    expect(mockedExecSync).toHaveBeenCalledTimes(1); // the version check only
+    const skipped = expect.stringContaining(
+      `teamai is running from ${path.join('/home', 'u', 'dev', 'teamai-cli')}, which is not an npm install`,
+    );
+    expect(mockedLog.warn).toHaveBeenCalledWith(skipped);
+    // Hooks send stderr to /dev/null; debug.log is where the warning survives.
+    expect(mockedLog.persist).toHaveBeenCalledWith(skipped);
+    expect(mockedLog.success).not.toHaveBeenCalled();
+  });
+
+  it('refuses a linked checkout before asking to confirm under the prompt policy', async () => {
+    const origIsTTY = process.stdin.isTTY;
+    Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+    try {
+      mockedLoadLocalConfig.mockResolvedValue({
+        repo: { localPath: '/tmp/repo', remote: 'https://...' },
+        username: 'testuser',
+        updatePolicy: 'prompt',
+      });
+      fileURLToPathMock.mockReturnValue(path.join('/home', 'u', 'dev', 'teamai-cli', 'dist', 'index.js'));
+      mockedExecSync.mockResolvedValue({ stdout: '99.0.0\n', stderr: '' });
+
+      await doUpdate();
+
+      expect(askConfirmation).not.toHaveBeenCalled();
+      expect(mockedLog.warn).toHaveBeenCalledWith(expect.stringContaining('Self-update skipped'));
+      expect(mockedExecSync).toHaveBeenCalledTimes(1); // the version check only
+    } finally {
+      Object.defineProperty(process.stdin, 'isTTY', { value: origIsTTY, configurable: true });
+    }
   });
 
   it('warns when the post-update verification finds the running install stale', async () => {

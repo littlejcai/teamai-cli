@@ -6,16 +6,26 @@
  * The dispatcher reads STDIN once and fans out to all registered handlers.
  *
  * Design:
- *   - Handlers are pure functions: (stdin, tool) → output | null
+ *   - Handlers are pure functions: (stdin, tool, config) → output | null, where
+ *     config is the scope the dispatcher resolved for the hook's cwd
  *   - Promise.allSettled ensures one handler crash doesn't take down others
  *   - Compatible structured outputs are merged so concurrent hints are preserved
  */
+
+import type { LocalConfig } from './types.js';
+import { log } from './utils/logger.js';
 
 // ─── Public types ───────────────────────────────────────
 
 export interface HookHandler {
   name: string;
-  execute(stdin: Record<string, unknown>, tool: string): Promise<string | null>;
+  /**
+   * `config` is the scope the dispatcher resolved for the hook's cwd, or null
+   * when none applies (teamai not set up there, or its config unreadable).
+   * Handlers read their scope from it, never from the process cwd: the
+   * dispatcher's chdir into the hook's cwd can fail (#752).
+   */
+  execute(stdin: Record<string, unknown>, tool: string, config: LocalConfig | null): Promise<string | null>;
 }
 
 export interface HandlerRegistration {
@@ -51,6 +61,8 @@ export interface DispatchResult {
 
 export interface DispatcherConfig {
   handlers: HandlerRegistration[];
+  /** The scope every handler runs in; see HookHandler.execute. */
+  localConfig: LocalConfig | null;
 }
 
 export interface Dispatcher {
@@ -79,7 +91,7 @@ function asObject(value: unknown): JsonObject | null {
 }
 
 /** Merge the two hook output schemas used by the supported hosts. */
-function mergeHookOutputs(outputs: string[]): string | null {
+export function mergeHookOutputs(outputs: string[]): string | null {
   if (outputs.length === 0) return null;
   if (outputs.length === 1) return outputs[0];
 
@@ -164,12 +176,42 @@ export function createDispatcher(config: DispatcherConfig): Dispatcher {
       });
 
       // Execute all matched handlers concurrently with isolation + per-handler timeout
+      const timings: Array<{ handler: string; ms: number; outcome: string }> = [];
+      const startedAt = Date.now();
       const settled = await Promise.allSettled(
         matched.map((reg) => {
           const timeoutMs = reg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-          return withTimeout(reg.handler.execute(stdin, tool), timeoutMs, reg.handler.name);
+          const handlerStartedAt = Date.now();
+          const record = (outcome: string) => {
+            timings.push({ handler: reg.handler.name, ms: Date.now() - handlerStartedAt, outcome });
+          };
+          return withTimeout(reg.handler.execute(stdin, tool, config.localConfig), timeoutMs, reg.handler.name).then(
+            (value) => {
+              record('ok');
+              return value;
+            },
+            (err: unknown) => {
+              // The message duplicates what hook-dispatch-cli already logs for a
+              // failed handler; 'timeout' names the case that log cannot explain.
+              record(err instanceof Error && /exceeded timeout/.test(err.message) ? 'timeout' : 'failed');
+              throw err;
+            },
+          );
         }),
       );
+      // Per-handler wall-clock, slowest first. Diagnostic only: every handler keeps
+      // the caller's own timeout budget, so this reports what already happened
+      // rather than changing it. Concurrent handlers make `total` the floor any
+      // single handler imposes, not the sum — the gap between `total` and the
+      // slowest handler is time spent in module loading before the handler ran.
+      if (matched.length > 0) {
+        const slowest = timings.reduce((a, b) => (b.ms > a.ms ? b : a), timings[0]);
+        const detail = [...timings]
+          .sort((a, b) => b.ms - a.ms)
+          .map((t) => `${t.handler}=${t.ms}ms(${t.outcome})`)
+          .join(' ');
+        log.debug(`[hook-dispatch] ${event}/${tool} ${mode}: ${Date.now() - startedAt}ms total, ${matched.length} handlers, slowest ${slowest.handler}=${slowest.ms}ms | ${detail}`);
+      }
 
       // Collect results
       const outputs: string[] = [];

@@ -7,6 +7,8 @@ let mockFiles: Record<string, unknown> = {};
 
 vi.mock('../utils/fs.js', () => ({
   readJson: vi.fn(async (filePath: string) => mockFiles[filePath] ?? null),
+  readJsonObject: vi.fn(async (filePath: string) => (filePath in mockFiles
+    ? { kind: 'ok', value: mockFiles[filePath] } : { kind: 'missing' })),
   writeJson: vi.fn(async (filePath: string, data: unknown) => {
     mockFiles[filePath] = JSON.parse(JSON.stringify(data));
   }),
@@ -64,22 +66,23 @@ describe('hooks', () => {
   });
 
   describe('inject — empty file', () => {
-    it('Claude format: injects 4 events with 6 dispatch hooks into empty settings.json', async () => {
+    it('Claude format: injects 5 events with 7 dispatch hooks into empty settings.json', async () => {
       await injectHooks('/test/settings.json', 'claude');
 
       const result = mockFiles['/test/settings.json'] as { hooks: Record<string, unknown[]> };
       expect(result.hooks).toBeDefined();
 
       const events = Object.keys(result.hooks);
-      expect(events).toEqual(['SessionStart', 'Stop', 'PostToolUse', 'UserPromptSubmit']);
+      expect(events).toEqual(['SessionStart', 'Stop', 'PostToolUse', 'UserPromptSubmit', 'SubagentStop']);
 
       // Merged dispatch format: one dispatch entry per event+matcher.
       // SessionStart(*:1), Stop(*:1),
-      // PostToolUse(*:1, Skill:1, TodoWrite:1), UserPromptSubmit(*:1)
+      // PostToolUse(*:1, Skill:1, TodoWrite:1), UserPromptSubmit(*:1), SubagentStop(*:1)
       expect(result.hooks['SessionStart']).toHaveLength(1);
       expect(result.hooks['Stop']).toHaveLength(1);
       expect(result.hooks['PostToolUse']).toHaveLength(3);
       expect(result.hooks['UserPromptSubmit']).toHaveLength(1);
+      expect(result.hooks['SubagentStop']).toHaveLength(1);
     });
 
     it('Cursor format: injects 4 events with 6 dispatch hooks into empty hooks.json', async () => {
@@ -104,10 +107,18 @@ describe('hooks', () => {
 
       const result = mockFiles['/test/codex-hooks.json'] as { hooks: Record<string, Array<{ matcher?: string; description?: string; hooks: Array<{ command: string }> }>> };
       expect(result.hooks).toBeDefined();
-      expect(Object.keys(result.hooks)).toEqual(['SessionStart', 'Stop', 'PostToolUse', 'UserPromptSubmit']);
+      expect(Object.keys(result.hooks)).toEqual(['SessionStart', 'Stop', 'PostToolUse', 'UserPromptSubmit', 'SubagentStop', 'SubagentStart']);
       expect(result.hooks.PostToolUse).toHaveLength(3);
       expect(result.hooks.SessionStart[0].hooks[0].command).toContain('--tool codex');
       expect(result.hooks.SessionStart[0].description).toBeUndefined();
+    });
+
+    it('Codex format: writes additionalContextLimit 0 on the session-start entry only (#938)', async () => {
+      await injectHooks('/test/codex-hooks.json', 'codex');
+
+      const result = mockFiles['/test/codex-hooks.json'] as { hooks: Record<string, Array<{ hooks: Array<{ additionalContextLimit?: number }> }>> };
+      expect(result.hooks.SessionStart[0].hooks[0].additionalContextLimit).toBe(0);
+      expect(result.hooks.Stop[0].hooks[0]).not.toHaveProperty('additionalContextLimit');
     });
 
     it('Claude uses PascalCase event names', async () => {
@@ -493,8 +504,10 @@ describe('hooks', () => {
       const claudeResult = mockFiles['/test/claude.json'] as { hooks: Record<string, unknown[]> };
       const cursorResult = mockFiles['/test/cursor.json'] as { hooks: Record<string, unknown[]> };
 
-      const claudeEvents = Object.keys(claudeResult.hooks).sort();
+      // Cursor gets no SubagentStop: its subagents run in sessions no hook links to the parent (#884).
+      const claudeEvents = Object.keys(claudeResult.hooks).filter((e) => e !== 'SubagentStop').sort();
       const cursorEvents = Object.keys(cursorResult.hooks).sort();
+      expect(cursorEvents).not.toContain('subagentStop');
 
       expect(claudeEvents).toHaveLength(cursorEvents.length);
 

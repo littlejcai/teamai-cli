@@ -2,7 +2,8 @@
 import path from 'node:path';
 
 import { listFiles, pathExists, readFileSafe } from '../utils/fs.js';
-import { loadUserVotes } from '../votes.js';
+import { listLearningFiles } from '../utils/learnings-roots.js';
+import { readUserVotes } from '../votes.js';
 import { log } from '../utils/logger.js';
 
 export interface StaleEntry {
@@ -47,7 +48,7 @@ export async function findStaleEntries(
     const filePath = path.join(votesDir, file);
 
     try {
-      const data = await loadUserVotes(filePath);
+      const data = await readUserVotes(filePath);
       for (const [docId, entry] of Object.entries(data.votes)) {
         const existing = perDoc.get(docId) ?? { recalled: 0, upvoted: 0, users: new Set<string>() };
         existing.recalled += entry.recalled_count ?? 0;
@@ -125,7 +126,7 @@ export function reportStaleEntries(entries: StaleEntry[]): void {
 export async function findRelatedAdoptedLearnings(
   staleEntry: StaleEntry,
   votesDir: string,
-  learningsDir: string,
+  learningsDirs: readonly string[],
   limit: number = 5,
 ): Promise<string[]> {
   const perDoc = new Map<string, number>();
@@ -134,7 +135,7 @@ export async function findRelatedAdoptedLearnings(
   for (const file of voteFiles) {
     if (!file.endsWith('.yaml') && !file.endsWith('.yml')) continue;
     try {
-      const data = await loadUserVotes(path.join(votesDir, file));
+      const data = await readUserVotes(path.join(votesDir, file));
       for (const [docId, entry] of Object.entries(data.votes)) {
         if (docId === staleEntry.docId) continue;
         if ((entry.upvoted_count ?? 0) > 0) {
@@ -150,10 +151,14 @@ export async function findRelatedAdoptedLearnings(
     .sort((a, b) => b[1] - a[1])
     .slice(0, limit);
 
+  const byName = new Map(
+    (await listLearningFiles(learningsDirs)).map((learning) => [learning.file, learning.absPath]),
+  );
   const contents: string[] = [];
   for (const [docId] of sorted) {
     const filename = docId.endsWith('.md') ? docId : `${docId}.md`;
-    const filePath = path.join(learningsDir, filename);
+    const filePath = byName.get(filename);
+    if (!filePath) continue;
     const content = await readFileSafe(filePath);
     if (content) contents.push(content);
   }

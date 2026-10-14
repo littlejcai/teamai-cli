@@ -25,7 +25,7 @@ upstream API"). Treat this as your query.
 Before any classification or search, run a single lightweight precheck:
 
 ```bash
-teamai recall --check "<3-6 keywords from the task>"
+teamai recall --caller teamai-recall --check "<3-6 keywords from the task>"
 ```
 
 - If the output starts with `NOT_RELEVANT`: the team knowledge base has no
@@ -43,8 +43,15 @@ teamai recall --check "<3-6 keywords from the task>"
   computed over titles and tags only, so a term reported missing may still be
   discussed in a body that a full recall (or a `Grep`) will surface. Only
   `NOT_RELEVANT` short-circuits the flow.
-- If the command fails or `teamai` is not on PATH: skip the precheck and
-  continue to Step 1 (do not block on precheck failure).
+- If the output (stdout or stderr) contains `Nothing was searched:`: this
+  project's teamai config cannot be read, so no team knowledge was searched.
+  Return that line from `Nothing was searched:` to its end, verbatim (it names
+  the file and the fix), and **stop** — do not report "no relevant team
+  knowledge", and do not proceed to Step 1–5. Add that the main conversation
+  should show it to the user and must not move the file or run `teamai init`
+  without the user's consent: that replaces their settings for this project.
+- If the command fails in any other way or `teamai` is not on PATH: skip the
+  precheck and continue to Step 1 (do not block on precheck failure).
 
 #### Complexity quick-judge (after RELEVANT)
 
@@ -70,7 +77,7 @@ Suggested files: <sources from --check output>
 **Stop here** — skip Steps 1–5 entirely.
 
 **If LOW but `--check` output lacks `sources=`**: run
-`teamai recall <keywords> --depth context`, take only the top-1 result's
+`teamai recall --caller teamai-recall <keywords> --depth context`, take only the top-1 result's
 title + Sources, return the same short format above, and skip Steps 1–5.
 
 **If not LOW**: continue to Step 1 as normal.
@@ -186,10 +193,10 @@ Execute with the appropriate depth:
 
 ```bash
 # Default: searches overview, modules, and docs (context layer)
-teamai recall "<keyword1> <keyword2> ..."
+teamai recall --caller teamai-recall "<keyword1> <keyword2> ..."
 
 # For precise symbol/line-number lookups, use lookup depth:
-teamai recall --depth lookup "<keyword1> <keyword2> ..."
+teamai recall --caller teamai-recall --depth lookup "<keyword1> <keyword2> ..."
 ```
 
 This searches all four knowledge categories (`skills`, `learnings`,
@@ -199,9 +206,10 @@ in `teamwiki/` with BM25 + graph-boost. Capture the full output.
 If the first call returns insufficient results, you may retry once with
 `--depth lookup` to broaden the search to raw symbol pages.
 
-If the command fails, knowledge base is empty, or returns zero hits,
-emit a single line `No relevant team knowledge found for: <query>` and
-stop.
+If the output contains `Nothing was searched:`, return that line from the
+marker on and stop, as in Step 0. If the command fails otherwise, knowledge base is
+empty, or returns zero hits, emit a single line
+`No relevant team knowledge found for: <query>` and stop.
 
 ### Step 4 — Read the top hits and drill into codebase
 
@@ -245,6 +253,7 @@ condense each into **one or two sentences**.
   retain the `Sources:` file anchors from the facts page (do not discard them
   in favour of the module summary alone); cross-reference those anchor files
   against graph-index.json edges to surface dependency relationships.
+- Check the separate `Source freshness:` line when recall returns one. It reports status per cited source and may include `(last scan: <timestamp>)`. `current` means only that the cited file's content hash matches the scan baseline; it does not certify the knowledge document. For `stale`, read the current source and revalidate related claims before using them. For `missing`, check whether the file moved or has a replacement before relying on the old citation. For `unknown` (or when no freshness status is reported), say that freshness could not be established and inspect the source when available. Do not extend one source's status to the whole page, project, or unlisted files. The scan time is the baseline extraction time, not a document review time.
 - If you need architectural context (why a module exists, design decisions),
   check `overview.md` in the same project directory.
 - If the hit mentions a knowledge gap (from `gaps/detected.md`), relay
@@ -361,14 +370,16 @@ rather than dropping the reasoning.
   query. This tells the main conversation to stop and ask the user rather
   than hallucinating.
 - The trailing HTML comment **must** list every doc_id you returned —
-  later phases (Phase 3 Stop hook) will parse this from the conversation
-  transcript.
-- **不要自己输出带内容的 `teamai:referenced-doc-ids` 标记** —— 那是主对话的职责。你只需在返回末尾另起一行提示主对话：`👉 主对话：完成任务后请在最终回复末尾声明实际引用的 doc-id（从上面 recalled-doc-ids 列表中挑出真正用到的），方括号内只填用到的、没用到就留空。` 这样主对话是"剪枝"而非"凭记忆重建"，能显著提高声明率。
+  the opt-in upvote judge reads it from the conversation transcript at the
+  Stop hook.
 
 ## Hard rules
 
 - **Do not** copy entire file contents into your response. Summarize.
 - **Do not** call `teamai recall` more than 3 times in one invocation.
+- Pass `--caller teamai-recall` on every `teamai recall` call, `--check`
+  included, exactly as the commands above show. It marks the run as yours, so
+  your own reads of the docs it returns don't count as the team using them.
 - **Do not** invoke other subagents.
 - If `teamai` CLI is not on PATH, return `teamai CLI not available` and stop.
 - Output total ≤ ~2500 characters (≤ 1500 for bugfix and diagnose tasks). This

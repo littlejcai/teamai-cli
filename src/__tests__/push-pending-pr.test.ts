@@ -30,6 +30,7 @@ const mockCreatePullRequest = vi.fn();
 const mockAskSelection = vi.fn();
 
 vi.mock('../utils/prompt.js', () => ({
+  isInteractive: vi.fn(() => true),
   askQuestion: vi.fn(() => Promise.resolve('1')),
   askConfirmation: vi.fn(() => Promise.resolve(true)),
   askSelection: (...args: unknown[]) => mockAskSelection(...args),
@@ -37,7 +38,8 @@ vi.mock('../utils/prompt.js', () => ({
   closePrompt: vi.fn(),
 }));
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   autoDetectInit: (...args: unknown[]) => mockAutoDetectInit(...args),
   loadStateForScope: (...args: unknown[]) => mockLoadStateForScope(...args),
   saveStateForScope: (...args: unknown[]) => mockSaveStateForScope(...args),
@@ -62,13 +64,15 @@ vi.mock('../utils/git.js', () => ({
   isDedicatedRepoRoot: vi.fn().mockResolvedValue(true),
   getDefaultBranch: vi.fn().mockResolvedValue('main'),
   getFileContentAtRev: vi.fn().mockResolvedValue(null),
+  getHeadCommit: vi.fn().mockResolvedValue('base000'),
 }));
 
 vi.mock('../resources/index.js', () => ({
   getHandler: (...args: unknown[]) => mockGetHandler(...args),
 }));
 
-vi.mock('../resources/skills.js', () => ({
+vi.mock('../resources/skills.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../resources/skills.js')>(),
   scanTeamRepoNamespaces: vi.fn().mockResolvedValue([]),
 }));
 
@@ -184,6 +188,15 @@ describe('pending push records', () => {
     const found = findPendingForItem([makeEntry()], makeItem({ relativePath: 'skills/hello-skill' }));
     expect(found).toHaveLength(1);
     expect(findPendingForItem([makeEntry()], makeItem({ name: 'other' }))).toHaveLength(0);
+  });
+
+  it('matches a resource already on the team repo by destination, so a same-named skill is another resource', () => {
+    const entry = makeEntry({ items: [{ type: 'skills', name: 'foo', relativePath: 'skills/svc-b/foo' }] });
+    const svcA = makeItem({ name: 'foo', status: 'modified', relativePath: 'skills/svc-a/foo' });
+    const svcB = makeItem({ name: 'foo', status: 'modified', relativePath: 'skills/svc-b/foo' });
+    expect(findPendingForItem([entry], svcA)).toEqual([]);
+    expect(findPendingForItem([entry], svcB)).toEqual([entry]);
+    expect(partiallySelectedEntries([svcA], [entry])).toEqual([]);
   });
 
   it('reuses a record when the selection covers all of its resources', () => {
@@ -308,7 +321,7 @@ describe('push() with an open PR', () => {
   it('updates the open PR instead of opening a second one', async () => {
     mockLoadStateForScope.mockResolvedValue(makeState([makeEntry()]));
 
-    await push({});
+    await push({ branch: 'feature/should-not-override' });
 
     expect(mockCreatePullRequest).not.toHaveBeenCalled();
     expect(mockPushRepoBranch).toHaveBeenCalledTimes(1);
@@ -370,6 +383,16 @@ describe('push() with an open PR', () => {
     })]);
   });
 
+  it('uses --branch for a new push instead of generating a timestamp branch', async () => {
+    mockLoadStateForScope.mockResolvedValue(makeState());
+
+    await push({ all: true, branch: 'feature/gitee-destination' });
+
+    expect(mockPushRepoBranch.mock.calls[0][3]).toBe('feature/gitee-destination');
+    const saved = mockSaveStateForScope.mock.calls.at(-1)?.[0] as State;
+    expect(saved.pendingPushes[0].branch).toBe('feature/gitee-destination');
+  });
+
   it('re-pushes as a new PR once the recorded branch is gone from origin', async () => {
     mockRemoteBranchExists.mockResolvedValue(false);
     mockLoadStateForScope.mockResolvedValue(makeState([makeEntry()]));
@@ -427,7 +450,7 @@ describe('push() with an open PR', () => {
       pushItem: vi.fn(),
     }));
 
-    await push({ all: true, skill: 'target' });
+    await push({ all: true, skill: '/home/u/.cursor/skills/target' });
 
     const saved = mockSaveStateForScope.mock.calls.at(-1)?.[0] as State;
     const branches = saved.pendingPushes.map((p) => p.branch).sort();
@@ -476,4 +499,203 @@ describe('push() with an open PR', () => {
       expect(saved.pendingPushes.map((p) => p.branch)).toContain('teamai/push/testuser/solo-branch');
     });
   });
+
+  // Codex review finding 7: a reuse entry recorded with prUrl:null (earlier PR
+  // creation failed) previously skipped createPrWithFallback entirely — so the
+  // PR was never re-created (resources stranded on a branch) AND the run wrongly
+  // reported completed=true, firing the `push` webhook. The reuse branch with an
+  // absent prUrl must now retry PR creation.
+  describe('reuse entry whose earlier PR creation failed (prUrl:null)', () => {
+    it('retries PR creation for the reuse branch and heals the record on success (with tree changes)', async () => {
+      mockLoadStateForScope.mockResolvedValue(makeState([makeEntry({ prUrl: null })]));
+      mockCreatePullRequest.mockResolvedValue('https://github.com/team/repo/pull/17');
+
+      const outcome = { completed: false };
+      await push({}, outcome);
+
+      // The absent PR is (re)created for the EXISTING reuse branch — no duplicate,
+      // and force-pushed in place.
+      expect(mockCreatePullRequest).toHaveBeenCalledTimes(1);
+      expect(mockPushRepoBranch.mock.calls[0][3]).toBe('teamai/push/testuser/20260827-065032');
+      expect(mockPushRepoBranch.mock.calls[0][4]).toEqual({ reuseBranch: true });
+      // A real completed push → webhook may fire.
+      expect(outcome.completed).toBe(true);
+      // The pending entry now carries the newly-created prUrl (healed).
+      const saved = mockSaveStateForScope.mock.calls.at(-1)?.[0] as State;
+      const entry = saved.pendingPushes.find((p) => p.branch === 'teamai/push/testuser/20260827-065032');
+      expect(entry?.prUrl).toBe('https://github.com/team/repo/pull/17');
+    });
+
+    it('does NOT complete when the retry PR creation fails (stays prUrl:null, exitCode 1)', async () => {
+      mockLoadStateForScope.mockResolvedValue(makeState([makeEntry({ prUrl: null })]));
+      mockCreatePullRequest.mockResolvedValue(null);
+      const originalExitCode = process.exitCode;
+
+      try {
+        const outcome = { completed: false };
+        await push({}, outcome);
+
+        expect(mockCreatePullRequest).toHaveBeenCalledTimes(1);
+        expect(process.exitCode).toBe(1);
+        // No completed push → no webhook.
+        expect(outcome.completed).toBe(false);
+        // The entry stays prUrl:null so a future run retries again.
+        const saved = mockSaveStateForScope.mock.calls.at(-1)?.[0] as State;
+        const entry = saved.pendingPushes.find((p) => p.branch === 'teamai/push/testuser/20260827-065032');
+        expect(entry?.prUrl).toBeNull();
+      } finally {
+        process.exitCode = originalExitCode;
+      }
+    });
+
+    it('does NOT re-create a PR when the reuse entry already has a prUrl', async () => {
+      mockLoadStateForScope.mockResolvedValue(makeState([makeEntry()]));  // prUrl present
+
+      const outcome = { completed: false };
+      await push({}, outcome);
+
+      // Existing PR is updated in place — never a duplicate creation.
+      expect(mockCreatePullRequest).not.toHaveBeenCalled();
+      expect(mockPushRepoBranch.mock.calls[0][4]).toEqual({ reuseBranch: true });
+      expect(outcome.completed).toBe(true);
+    });
+  });
+
+  // Codex review finding 11: the recovery must also work when the tree is
+  // UNCHANGED. On re-run the branch already holds the resources, so
+  // pushRepoBranch({reuseBranch:true}) returns false (nothing to push). The old
+  // code short-circuited to 'nochange' BEFORE the PR-retry block, so the missing
+  // PR was never created. These drive the REAL no-change path (pushRepoBranch
+  // false) rather than inheriting the beforeEach's `true`.
+  describe('reuse entry with prUrl:null AND no tree change (finding 11 recovery)', () => {
+    it('still (re)creates the PR without re-pushing, and heals the record', async () => {
+      mockLoadStateForScope.mockResolvedValue(makeState([makeEntry({ prUrl: null })]));
+      mockPushRepoBranch.mockResolvedValue(false);  // no tree change
+      mockCreatePullRequest.mockResolvedValue('https://github.com/team/repo/pull/21');
+
+      const outcome = { completed: false };
+      await push({}, outcome);
+
+      // The missing PR IS created even though nothing was pushed.
+      expect(mockCreatePullRequest).toHaveBeenCalledTimes(1);
+      expect(outcome.completed).toBe(true);
+      const saved = mockSaveStateForScope.mock.calls.at(-1)?.[0] as State;
+      const entry = saved.pendingPushes.find((p) => p.branch === 'teamai/push/testuser/20260827-065032');
+      expect(entry?.prUrl).toBe('https://github.com/team/repo/pull/21');
+    });
+
+    it('does NOT complete when the no-change retry PR creation fails (exitCode 1, stays null)', async () => {
+      mockLoadStateForScope.mockResolvedValue(makeState([makeEntry({ prUrl: null })]));
+      mockPushRepoBranch.mockResolvedValue(false);  // no tree change
+      mockCreatePullRequest.mockResolvedValue(null);
+      const originalExitCode = process.exitCode;
+
+      try {
+        const outcome = { completed: false };
+        await push({}, outcome);
+
+        expect(mockCreatePullRequest).toHaveBeenCalledTimes(1);
+        expect(process.exitCode).toBe(1);
+        expect(outcome.completed).toBe(false);
+        const saved = mockSaveStateForScope.mock.calls.at(-1)?.[0] as State;
+        const entry = saved.pendingPushes.find((p) => p.branch === 'teamai/push/testuser/20260827-065032');
+        expect(entry?.prUrl).toBeNull();
+      } finally {
+        process.exitCode = originalExitCode;
+      }
+    });
+
+    it('reports nochange (no PR call) when the reuse entry already has a prUrl and no tree change', async () => {
+      mockLoadStateForScope.mockResolvedValue(makeState([makeEntry()]));  // prUrl present
+      mockPushRepoBranch.mockResolvedValue(false);  // no tree change
+
+      const outcome = { completed: false };
+      await push({}, outcome);
+
+      // PR already exists and nothing changed → genuinely nothing to do.
+      expect(mockCreatePullRequest).not.toHaveBeenCalled();
+      expect(outcome.completed).toBe(false);
+    });
+  });
+});
+
+// ─── Same-named skills in two namespaces ─────────────────
+
+describe('push() keys an open PR by destination, not by name', () => {
+  const svcA = (): ResourceItem => makeItem({
+    name: 'foo', status: 'modified', namespace: 'svc-a', fromInactiveNamespace: true,
+    sourcePath: '/home/u/.claude/skills/foo', relativePath: 'skills/svc-a/foo',
+  });
+  const svcB = (): ResourceItem => makeItem({
+    name: 'foo', status: 'modified', namespace: 'svc-b', fromInactiveNamespace: true,
+    sourcePath: '/home/u/.codex/skills/foo', relativePath: 'skills/svc-b/foo',
+  });
+  const openBranch = 'teamai/push/testuser/20260827-065032';
+  const newBranch = 'teamai/push/testuser/20260827-070000';
+  // A record as this CLI writes it, and one with only the fields every
+  // earlier version wrote: type, name and destination.
+  const records = {
+    fresh: { type: 'skills', name: 'foo', relativePath: 'skills/svc-b/foo', namespace: 'svc-b' },
+    legacy: { type: 'skills', name: 'foo', relativePath: 'skills/svc-b/foo' },
+  } as const;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.exitCode = 0;
+    mockPullRepo.mockResolvedValue('Already up to date.');
+    mockPushRepoBranch.mockResolvedValue(true);
+    mockCheckoutMaster.mockResolvedValue(undefined);
+    mockGenerateBranchName.mockReturnValue(newBranch);
+    mockRemoteBranchExists.mockResolvedValue(true);
+    mockCreatePullRequest.mockResolvedValue('https://github.com/team/repo/pull/9');
+    mockSaveStateForScope.mockResolvedValue(undefined);
+    mockAskSelection.mockImplementation(
+      (_p: string, count: number) => Promise.resolve(Array.from({ length: count }, (__, i) => i)),
+    );
+    mockAutoDetectInit.mockResolvedValue({ localConfig: makeLocalConfig(), teamConfig: makeTeamConfig() });
+  });
+
+  type Scan = 'svc-a' | 'svc-b' | 'svc-a, svc-b' | 'svc-b, svc-a';
+  const scans: Record<Scan, () => ResourceItem[]> = {
+    'svc-a': () => [svcA()],
+    'svc-b': () => [svcB()],
+    'svc-a, svc-b': () => [svcA(), svcB()],
+    'svc-b, svc-a': () => [svcB(), svcA()],
+  };
+  // branch → destinations pushed on it
+  const cases: Array<[openPr: boolean, scan: Scan, expected: Record<string, string[]>]> = [
+    [false, 'svc-a', { [newBranch]: ['skills/svc-a/foo'] }],
+    [false, 'svc-b', { [newBranch]: ['skills/svc-b/foo'] }],
+    [false, 'svc-a, svc-b', { [newBranch]: ['skills/svc-a/foo', 'skills/svc-b/foo'] }],
+    [true, 'svc-a', { [newBranch]: ['skills/svc-a/foo'] }],
+    [true, 'svc-b', { [openBranch]: ['skills/svc-b/foo'] }],
+    [true, 'svc-a, svc-b', { [openBranch]: ['skills/svc-b/foo'], [newBranch]: ['skills/svc-a/foo'] }],
+    [true, 'svc-b, svc-a', { [openBranch]: ['skills/svc-b/foo'], [newBranch]: ['skills/svc-a/foo'] }],
+  ];
+
+  for (const state of ['fresh', 'legacy'] as const) {
+    for (const [openPr, scan, expected] of cases) {
+      it(`${state} state, open PR for svc-b/foo: ${openPr ? 'exists' : 'none'}, scan: ${scan}`, async () => {
+        mockLoadStateForScope.mockResolvedValue(makeState(openPr ? [makeEntry({ items: [{ ...records[state] }] })] : []));
+        mockGetHandler.mockImplementation((type: string) => ({
+          scanLocalForPush: vi.fn().mockResolvedValue(type === 'skills' ? scans[scan]() : []),
+          pushItem: vi.fn(),
+        }));
+
+        await push({ all: true });
+
+        const pushed = Object.fromEntries(mockPushRepoBranch.mock.calls.map((call) => [
+          call[3] as string,
+          (call[2] as string[]).filter((p) => p.startsWith('skills/')).sort(),
+        ]));
+        expect(pushed).toEqual(expected);
+        expect(mockCreatePullRequest).toHaveBeenCalledTimes(expected[newBranch] ? 1 : 0);
+        // The open PR stays recorded whether or not this run updated it.
+        const recorded = openPr ? { [openBranch]: ['skills/svc-b/foo'], ...expected } : expected;
+        const saved = mockSaveStateForScope.mock.calls.at(-1)?.[0] as State;
+        expect(saved.pendingPushes.map((p) => [p.branch, p.items.map((i) => i.relativePath).sort()]).sort())
+          .toEqual(Object.entries(recorded).sort());
+      });
+    }
+  }
 });

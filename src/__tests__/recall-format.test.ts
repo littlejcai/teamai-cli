@@ -5,6 +5,9 @@
  * a formatted string.  No filesystem or network access required.
  */
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { formatResults } from '../recall.js';
 import type { SearchIndexEntry } from '../types.js';
@@ -70,6 +73,23 @@ describe('formatResults — Sources line', () => {
     ]);
 
     expect(output).not.toContain('Sources:');
+  });
+
+  it('prints source freshness separately so the existing Sources line stays unchanged', () => {
+    const output = formatResults([
+      {
+        entry: makeEntry({ title: 'Code Page', path: '/wiki/evidence/code/proj/foo.md' }),
+        score: 7.5,
+        scope: 'project',
+        sources: [
+          { path: 'src/a.ts', desc: 'authentication', freshness: 'current', lastScan: '2026-10-09T10:11:12.000Z' },
+          { path: 'src/b.ts', freshness: 'stale' },
+        ],
+      },
+    ]);
+
+    expect(output).toContain('Sources: src/a.ts (authentication), src/b.ts');
+    expect(output).toContain('Source freshness: src/a.ts=current (last scan: 2026-10-09T10:11:12.000Z); src/b.ts=stale');
   });
 
   it('普通 learnings 结果（无 sources、有 snippet）输出形态不变', () => {
@@ -141,5 +161,49 @@ describe('formatResults — term coverage', () => {
       },
     ]);
     expect(codebaseHit).not.toContain('Missing:');
+  });
+});
+
+describe('formatResults — a path that no longer exists', () => {
+  it('falls back to the learnings root when the indexed absolute path is gone', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-recall-format-'));
+    const base = path.join(tmp, 'learnings');
+    fs.mkdirSync(base, { recursive: true });
+    fs.writeFileSync(path.join(base, 'fixture.md'), '# still here');
+
+    try {
+      const output = formatResults([
+        {
+          // A worktree that was removed and rebuilt leaves this pointing nowhere.
+          entry: makeEntry({ path: path.join(tmp, 'learnings-wt-gone', 'learnings', 'fixture.md') }),
+          score: 3,
+          scope: 'user',
+          learningsBase: base,
+        },
+      ]);
+
+      expect(output).toContain(`File: ${path.join(base, 'fixture.md')}`);
+      expect(output).not.toContain('learnings-wt-gone');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('formatResults — closing line', () => {
+  // CLI output is English only (#822).
+  it('ends with the English reference note and prints no CJK text', () => {
+    const output = formatResults([
+      {
+        entry: makeEntry({ title: 'Regular Learning' }),
+        score: 6.0,
+        scope: 'user',
+      },
+    ]);
+
+    expect(output.split('\n').at(-1)).toBe(
+      'The above comes from the team knowledge base and is for reference only. Use the Read tool to open the listed files for details.',
+    );
+    expect(output).not.toMatch(/[\u3400-\u9fff]/);
   });
 });

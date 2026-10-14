@@ -6,7 +6,8 @@
  * evidence pages, router/hot/index navigation, and gaps detection.
  */
 
-import { mkdir, writeFile, readFile } from 'node:fs/promises';
+import { statSync } from 'node:fs';
+import { mkdir, writeFile, readFile, realpath, lstat } from 'node:fs/promises';
 import path from 'node:path';
 
 import chalk from 'chalk';
@@ -27,6 +28,11 @@ import {
   formatAstStatsSummary,
 } from './wiki-engine/adapters/index.js';
 import type { CodeFact, InterfaceInventory, CallChain } from './wiki-engine/adapters/index.js';
+import type { CodeCollectedFile } from './wiki-engine/code-knowledge/code-collector.js';
+import { CODE_COLLECTION_VERSION } from './wiki-engine/code-knowledge/code-collector.js';
+import type { ExtractorContext } from './wiki-engine/code-knowledge/extractors/index.js';
+import { SCALA_DECL_PREFIX, SCALA_WILDCARD_PREFIX } from './wiki-engine/code-knowledge/extractors/index.js';
+import { isMetadataRelation } from './wiki-engine/code-knowledge/code-extractors.js';
 import {
   loadFactsCache,
   saveFactsCache,
@@ -36,6 +42,9 @@ import {
   mergeInterfaceInventories,
 } from './wiki-engine/code-knowledge/code-incremental.js';
 import { writeIfChanged } from './utils/fs.js';
+import { createGit, redactGitCredentials, repoIdentity, resolveAnchors } from './utils/git.js';
+import { assertSafePath } from './utils/path-safety.js';
+import { repoName } from './utils/repo-attribution.js';
 import type { GraphIndex } from './wiki-engine/core/graph-index.schema.js';
 import { routerTemplate, indexTemplate, HOT_TEMPLATE } from './wiki-engine/adapters/templates.js';
 import type { DomainGroup, IndexStats } from './wiki-engine/adapters/templates.js';
@@ -79,6 +88,11 @@ interface KnowledgeGap {
   source: string;
 }
 
+/** 用户可见的 facts：元数据 relation（通配包名、顶层声明标记）不进任何统计。 */
+function visibleFactsOf(facts: CodeFact[]): CodeFact[] {
+  return facts.filter((f) => f.kind !== 'relation' || !isMetadataRelation(f.name));
+}
+
 function detectKnowledgeGaps(
   facts: CodeFact[],
   graph: GraphIndex,
@@ -86,7 +100,6 @@ function detectKnowledgeGaps(
 ): KnowledgeGap[] {
   const gaps: KnowledgeGap[] = [];
   const scannedFiles = new Set(files.map((f) => f.relativePath));
-  const nodeSlugs = new Set(graph.nodes.map((n) => n.slug));
   const connectedNodes = new Set<string>();
   for (const edge of graph.edges) {
     connectedNodes.add(edge.from);
@@ -94,7 +107,7 @@ function detectKnowledgeGaps(
   }
 
   // 1. 未解析的外部依赖：import target 不在扫描范围内
-  const relationFacts = facts.filter((f) => f.kind === 'relation');
+  const relationFacts = facts.filter((f) => f.kind === 'relation' && !isMetadataRelation(f.name));
   const unresolvedImports = new Set<string>();
   for (const rel of relationFacts) {
     const target = rel.name;
@@ -214,7 +227,7 @@ function buildEvidencePages(
     pages.set(`${kind}.md`, lines.join('\n'));
   }
 
-  const relationFacts = facts.filter((f) => f.kind === 'relation');
+  const relationFacts = facts.filter((f) => f.kind === 'relation' && !isMetadataRelation(f.name));
   if (relationFacts.length > 0) {
     const byDir = new Map<string, CodeFact[]>();
     for (const fact of relationFacts) {
@@ -296,7 +309,7 @@ function buildEvidencePages(
     '',
     `# ${project}`,
     '',
-    `Facts: ${facts.length} | Pages: ${pages.size}`,
+    `Facts: ${visibleFactsOf(facts).length} | Pages: ${pages.size}`,
     '',
   ];
 
@@ -465,7 +478,7 @@ function buildOverview(
     '',
     `# ${project}`,
     '',
-    `**${facts.length} facts** extracted from ${new Set(facts.map(f => f.file)).size} files.`,
+    `**${visibleFactsOf(facts).length} facts** extracted from ${new Set(facts.map(f => f.file)).size} files.`,
     `Graph: ${graph.nodes.length} nodes, ${graph.edges.length} edges.`,
     '',
     '## Module Structure',
@@ -533,28 +546,175 @@ function buildOverview(
   return lines.join('\n');
 }
 
-export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<void> {
+/**
+ * The wiki slug of `dir` when no `--project` is given (#809): a checkout's
+ * root, the main one or a linked worktree, takes its repo's name (repoName:
+ * the main checkout's real name, or a bare repo's), so every checkout of a repo
+ * writes the repo's evidence, whatever path it was opened by (#823); any other
+ * directory keeps its own name.
+ */
+export async function defaultProjectSlug(dir: string): Promise<string> {
+  if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) return path.basename(dir);
+  const anchors = await resolveAnchors(dir);
+  if (anchors && await realpath(dir) === anchors.workspaceRoot) {
+    return repoName(anchors.projectAnchor);
+  }
+  return path.basename(dir);
+}
+
+interface SourceRepositoryMetadata {
+  repoUrl?: string;
+  repoIdentity?: string;
+  sourceSubdir?: string;
+}
+
+interface StoredSourceManifest extends SourceRepositoryMetadata {
+  project?: string;
+  files?: Array<{ relativePath: string; sha256: string; language?: string }>;
+  repoIdentity?: string;
+  branch?: string;
+  ingestedMrs?: Array<{ url: string; headSha?: string; at: string }>;
+}
+
+function sanitizeRepoUrl(url: string): string {
+  const redacted = redactGitCredentials(url);
+  try {
+    const parsed = new URL(redacted);
+    parsed.username = '';
+    parsed.password = '';
+    return parsed.toString().replace(/\/$/, '');
+  } catch {
+    // scp-form URLs have no URL authority separator; retain their conventional
+    // `git@host:path` user while stripping userinfo from other malformed URLs.
+    return redacted.replace(/^(.+:\/\/)[^/@]*@/, '$1');
+  }
+}
+
+async function readStoredSourceManifest(filePath: string): Promise<StoredSourceManifest | null> {
+  try {
+    const parsed: unknown = JSON.parse(await readFile(filePath, 'utf8'));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? parsed as StoredSourceManifest
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function manifestMatchesSource(
+  manifest: StoredSourceManifest | null,
+  project: string,
+  source: SourceRepositoryMetadata,
+): manifest is StoredSourceManifest {
+  if (!manifest || !source.repoIdentity || source.sourceSubdir === undefined) return false;
+  if (manifest.project !== project || manifest.sourceSubdir !== source.sourceSubdir) return false;
+  if (typeof manifest.repoIdentity === 'string' && manifest.repoIdentity.trim()) {
+    return manifest.repoIdentity.trim() === source.repoIdentity;
+  }
+  if (typeof manifest.repoUrl !== 'string' || !manifest.repoUrl.trim()) return false;
+  try {
+    return repoIdentity(manifest.repoUrl) === source.repoIdentity;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read the repository provenance for a source root without contacting its
+ * remote. Hashes in source-manifest.json are relative to the extraction root,
+ * so retain only the relative path from the verified Git root.
+ */
+async function sourceRepositoryMetadata(
+  root: string,
+  explicitRepoUrl?: string,
+): Promise<SourceRepositoryMetadata> {
+  let sourceSubdir: string | undefined;
+  let remoteUrl = explicitRepoUrl;
+  try {
+    const git = createGit(root);
+    const gitRoot = (await git.revparse(['--show-toplevel'])).trim();
+    const [realGitRoot, realSourceRoot] = await Promise.all([realpath(gitRoot), realpath(root)]);
+    const relative = path.relative(realGitRoot, realSourceRoot);
+    if (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`)) {
+      sourceSubdir = relative.split(path.sep).filter(Boolean).join('/');
+    }
+    if (!remoteUrl) {
+      const remotes = await git.getRemotes(true);
+      remoteUrl = remotes.find((remote) => remote.name === 'origin')?.refs.fetch;
+    }
+  } catch {
+    // A repository identity/root that cannot be verified leaves freshness
+    // unknown. Extraction itself still works for non-Git directories.
+  }
+
+  if (!remoteUrl) return sourceSubdir !== undefined ? { sourceSubdir } : {};
+  const safeUrl = sanitizeRepoUrl(remoteUrl);
+  const identity = repoIdentity(safeUrl);
+  // Keep the historical repoUrl field for status output, after removing
+  // credentials, and store strict identity separately for freshness checks.
+  return {
+    repoUrl: safeUrl,
+    repoIdentity: identity,
+    ...(sourceSubdir !== undefined ? { sourceSubdir } : {}),
+  };
+}
+
+/**
+ * Extract code knowledge from `opts.path` into `<outputRoot>/teamwiki`.
+ *
+ * @returns false when nothing was written: an incremental run found no
+ *          changes, or the source has no extractable files
+ */
+export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<boolean> {
   const root = path.resolve(opts.path || '.');
-  const project = opts.project || path.basename(root);
+  const project = opts.project || await defaultProjectSlug(root);
+  const sourceRepo = await sourceRepositoryMetadata(root, opts.repoUrl);
   const maxFiles = opts.maxFiles || 200;
   const outputBase = opts.outputRoot ? path.resolve(opts.outputRoot) : root;
 
   const wikiRoot = path.join(outputBase, 'teamwiki');
   const evidenceDir = path.join(wikiRoot, 'evidence', 'code', project);
   const manifestPath = path.join(wikiRoot, 'source-manifest.json');
+  const projectManifestPath = path.join(evidenceDir, 'source-manifest.json');
+  assertSafePath(projectManifestPath, [wikiRoot]);
+  const sidecarStat = await lstat(projectManifestPath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error;
+    return null;
+  });
+  // A dangling link cannot be resolved by assertSafePath, but writeFile would
+  // follow it and create its target. Reject sidecar links before reading them.
+  if (sidecarStat?.isSymbolicLink()) {
+    throw new Error('Refusing to write source manifest through a symbolic link');
+  }
+  const rootManifest = await readStoredSourceManifest(manifestPath);
+  const projectManifest = await readStoredSourceManifest(projectManifestPath);
+  const rootMatchesSource = manifestMatchesSource(rootManifest, project, sourceRepo);
+  const projectMatchesSource = manifestMatchesSource(projectManifest, project, sourceRepo);
+  // The .indices facts cache is shared at teamwiki/.indices. Reuse it only
+  // while the root manifest proves that cache belongs to this exact source.
+  // If provenance is absent or another repo was extracted last, run a full
+  // hash scan rather than combining another repo's file/fact baseline.
+  // The Git diff helper reports repository-root-relative paths, while this
+  // extractor stores subdirectory-relative paths. Until those contracts are
+  // unified, subdirectory extracts must hash the complete source tree.
+  const incrementalBaselineMatches = sourceRepo.sourceSubdir === ''
+    && rootMatchesSource
+    && (!projectManifest || projectMatchesSource);
+  const incrementalManifestPath = projectMatchesSource ? projectManifestPath : manifestPath;
+  const provenanceManifest = projectMatchesSource ? projectManifest : rootMatchesSource ? rootManifest : null;
 
   let changedFiles: string[] | undefined;
   let deletedFiles: string[] = [];
-  if (opts.incremental) {
+  if (opts.incremental && incrementalBaselineMatches) {
     try {
-      const changes = await detectCodeIncrementalChanges(root, manifestPath, project);
+      const changes = await detectCodeIncrementalChanges(root, incrementalManifestPath, project, maxFiles);
       if (changes.added.length === 0 && changes.changed.length === 0 && changes.deleted.length === 0) {
         if (opts.json) {
           console.log(JSON.stringify({ status: 'up-to-date', project }));
         } else {
           console.log(chalk.green(`[extract] ${project}: no changes, skipped.`));
         }
-        return;
+        return false;
       }
       changedFiles = [...changes.added, ...changes.changed];
       deletedFiles = changes.deleted;
@@ -566,6 +726,41 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
         console.log(chalk.dim('[extract] no manifest history, running full extraction'));
       }
     }
+  } else if (opts.incremental && !opts.json) {
+    console.log(chalk.dim('[extract] no matching source baseline, running full extraction'));
+  }
+
+  // 增量模式下，import 在提取时物化为具体文件（通配 → 各成员、具名 → 声明
+  // 文件）；若本次只变更了被指向的文件而 importer 未变，物化结果已过期。
+  // 缓存的 scala-wildcard: 标记记录通配 importer 及其包；其余以 .scala/.java
+  // 结尾的 relation 名就是物化目标文件本身——两者任一受影响都重提取 importer
+  const indicesDir = path.join(wikiRoot, '.indices');
+  let cachedFacts: CodeFact[] | undefined;
+  if (changedFiles !== undefined) {
+    cachedFacts = await loadFactsCache(indicesDir);
+    const changedSet = new Set([...changedFiles, ...deletedFiles]);
+    const originalChangedFiles = changedFiles;
+    const staleImporters = new Set<string>();
+    for (const fact of cachedFacts) {
+      if (fact.kind !== 'relation' || fact.name.startsWith(SCALA_DECL_PREFIX)) continue;
+      const touchedPackage = (pkg: string): boolean =>
+        originalChangedFiles.some((f) => f.includes(`/${pkg}/`) || f.startsWith(`${pkg}/`)) ||
+        deletedFiles.some((f) => f.includes(`/${pkg}/`) || f.startsWith(`${pkg}/`));
+      if (fact.name.startsWith(SCALA_WILDCARD_PREFIX)) {
+        if (touchedPackage(fact.name.slice(SCALA_WILDCARD_PREFIX.length))) staleImporters.add(fact.file);
+      } else if (/\.(?:scala|java)$/.test(fact.name)) {
+        // 物化目标本身变了——importer 必须重新解析
+        if (changedSet.has(fact.name)) staleImporters.add(fact.file);
+      } else {
+        // 未物化的常规路径（com/demo/core/Invoice）：包目录里有文件增删时，
+        // 原本解析不到的目标可能已经可解析
+        const pkg = fact.name.split('/').slice(0, -1).join('/');
+        if (pkg && touchedPackage(pkg)) staleImporters.add(fact.file);
+      }
+    }
+    if (staleImporters.size > 0) {
+      changedFiles = [...new Set([...changedFiles, ...staleImporters])];
+    }
   }
 
   const { files, manifest: collectionManifest } = await collectCode({ root, maxFiles, changedFiles });
@@ -576,20 +771,42 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     } else {
       console.log(chalk.yellow(`[extract] ${project}: no extractable source files found.`));
     }
-    return;
+    return false;
   }
 
-  // 提取变更文件的新 facts
-  const newFacts = files.length > 0 ? extractCodeFacts(files) : [];
+  // 增量模式下，跨文件解析（通配展开、符号定位到声明文件）需要未变更文件的
+  // 路径与声明；两者都能从上一轮 facts 缓存得到，未变更文件无需重新读取。
+  // 声明只从 scala-decl: 标记重建——component facts 分不出嵌套成员，
+  // 标记在提取时就只记包级名字
+  let extractionContext: ExtractorContext | undefined;
+  if (changedFiles !== undefined) {
+    const priorDeclarations = new Map<string, Set<string>>();
+    const stubs = new Map<string, CodeCollectedFile>();
+    const removed = new Set([...changedFiles, ...deletedFiles]);
+    for (const fact of cachedFacts ?? []) {
+      if (!removed.has(fact.file)) {
+        stubs.set(fact.file, { path: fact.file, relativePath: fact.file, language: 'text', sha256: '', content: '' });
+      }
+      if (fact.kind === 'relation' && fact.name.startsWith(SCALA_DECL_PREFIX)) {
+        const names = new Set(fact.name.slice(SCALA_DECL_PREFIX.length).split(','));
+        priorDeclarations.set(fact.file, names);
+      }
+    }
+    for (const file of files) {
+      stubs.delete(file.relativePath); // 变更文件以本批为准
+    }
+    extractionContext = { allFiles: [...files, ...stubs.values()], priorDeclarations };
+  }
+
+  const newFacts = files.length > 0 ? extractCodeFacts(files, extractionContext) : [];
 
   // 增量模式：加载缓存 → 剪除 → 合并
   let facts: CodeFact[];
   let interfaceInventory: InterfaceInventory;
-  const indicesDir = path.join(wikiRoot, '.indices');
 
   if (changedFiles !== undefined) {
     // 增量模式（含 changedFiles=[] 即仅删除场景）
-    const oldFacts = await loadFactsCache(indicesDir);
+    const oldFacts = cachedFacts ?? (await loadFactsCache(indicesDir));
     const oldInterfaces = await loadInterfacesCache(indicesDir);
 
     // 剪除已变更/删除的旧数据
@@ -624,7 +841,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
 
 
   // AST track (web-tree-sitter WASM): resolve precise import/call edges for
-  // TS/JS/Python/Go. Runs alongside the regex heuristic track; AST facts win
+  // TS/JS/Python/Go/Swift. Runs alongside the regex heuristic track; AST facts win
   // on merge. Falls back to heuristic-only when the WASM runtime is unavailable
   // (e.g. TEAMAI_SKIP_AST=1) or throws, recording an AST_UNAVAILABLE gap.
   const astGaps: KnowledgeGap[] = [];
@@ -692,6 +909,10 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
   const pages = buildEvidencePages(facts, project, interfaceInventory, callChains);
 
   await mkdir(evidenceDir, { recursive: true });
+  // A project evidence directory may have been replaced by a symlink after
+  // extraction started. Do not let generated pages or the baseline escape the
+  // teamwiki root.
+  assertSafePath(evidenceDir, [wikiRoot]);
 
   // 增量模式下复用已有 dependency-paths.md
   if (changedFiles && !pages.has('dependency-paths.md')) {
@@ -711,6 +932,18 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
 
   // Merge overlay into the per-repo graph
   const repoGraph = mergeGraphs(graph, overlay);
+
+  // Stamp ownership before writing, same as buildAggregatedGraph does for an
+  // orchestrated `teamai import` (#974 review round 19 P1): when this write
+  // target IS the real teamwiki root (a direct extractCodebase call, not
+  // routed through import's staging directory), it lands straight in
+  // `teamwiki/.indices/graph-index.json` with no later aggregation step ever
+  // tagging it. Leaving it untagged would let a withheld codebase's fresh
+  // re-extraction bypass origin-based removal entirely, and the stale
+  // evidence/code/<slug>/ per-repo file the fallback would otherwise read
+  // can no longer be trusted to describe it either.
+  for (const node of repoGraph.nodes) node.origin = project;
+  for (const edge of repoGraph.edges) edge.origin = project;
 
   // Write per-repo graph only; global aggregation is done by aggregateGlobalGraph()
   // in import-repo.ts after all per-repo graphs are in place (avoids write races).
@@ -793,7 +1026,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     ifByType[e.type] = (ifByType[e.type] ?? 0) + e.count;
   }
   const indexStats: IndexStats = {
-    totalFacts: facts.length,
+    totalFacts: visibleFactsOf(facts).length,
     totalNodes: repoGraph.nodes.length,
     totalEdges: repoGraph.edges.length,
     interfaces: Object.keys(ifByType).length > 0 ? ifByType : undefined,
@@ -843,7 +1076,7 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
   if (changedFiles !== undefined && changedFiles.length > 0) {
     // 有变更/新增文件：合并旧 manifest 中未变更的记录 + 新扫描的记录
     try {
-      const oldManifestRaw = await readFile(manifestPath, 'utf-8');
+      const oldManifestRaw = await readFile(incrementalManifestPath, 'utf-8');
       const oldManifest = JSON.parse(oldManifestRaw) as {
         files?: Array<{ relativePath: string; sha256: string; language?: string }>;
       };
@@ -859,54 +1092,55 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
     allManifestFiles = allManifestFiles.filter(f => !deletedSet.has(f.relativePath));
   }
   // Persist git baseline from prior incremental manifest when not explicitly supplied
-  let prevRepoUrl: string | undefined;
-  let prevBranch: string | undefined;
-  let prevIngestedMrs: Array<{ url: string; headSha?: string; at: string }> = [];
-  // Always carry forward prior baseline provenance (repoUrl / branch /
-  // ingestedMrs) so a full re-extract does not silently drop it. A missing
-  // or unreadable manifest just leaves the defaults.
-  try {
-    const prev = JSON.parse(await readFile(manifestPath, 'utf-8')) as {
-      repoUrl?: string;
-      branch?: string;
-      ingestedMrs?: Array<{ url: string; headSha?: string; at: string }>;
-    };
-    prevRepoUrl = prev.repoUrl;
-    prevBranch = prev.branch;
-    prevIngestedMrs = prev.ingestedMrs ?? [];
-  } catch { /* no prior manifest */ }
+  const prevRepoUrl = provenanceManifest?.repoUrl;
+  const prevBranch = provenanceManifest?.branch;
+  const prevIngestedMrs = provenanceManifest?.ingestedMrs ?? [];
+  const sameSource = provenanceManifest !== null;
 
   const headSha = collectionManifest.commit;
   const manifestObject: Record<string, unknown> = {
-    version: 1,
+    version: CODE_COLLECTION_VERSION,
     lastScan: new Date().toISOString(),
+    project,
     files: allManifestFiles,
   };
+  if (sourceRepo.sourceSubdir !== undefined) manifestObject.sourceSubdir = sourceRepo.sourceSubdir;
   if (headSha) manifestObject.headSha = headSha;
-  const repoUrl = opts.repoUrl ?? prevRepoUrl;
+  const repoUrl = sourceRepo.repoUrl ?? (sameSource ? prevRepoUrl : undefined);
   const branch = opts.branch ?? prevBranch;
   if (repoUrl) manifestObject.repoUrl = repoUrl;
-  if (branch) manifestObject.branch = branch;
+  const currentRepoIdentity = sourceRepo.repoIdentity ?? (sameSource ? provenanceManifest?.repoIdentity : undefined);
+  if (currentRepoIdentity) manifestObject.repoIdentity = currentRepoIdentity;
+  // branch and MR provenance are tied to a source repository as well.
+  if (branch && (sameSource || opts.branch)) manifestObject.branch = branch;
   // P5: record ingested MR (upsert by url) when invoked via --from-mr
-  let ingestedMrs = prevIngestedMrs;
+  let ingestedMrs = sameSource ? prevIngestedMrs : [];
   if (opts.sourceMrUrl) {
     const at = new Date().toISOString();
     const entry = { url: opts.sourceMrUrl, headSha, at };
-    ingestedMrs = [...prevIngestedMrs.filter((m) => m.url !== opts.sourceMrUrl), entry];
+    ingestedMrs = [...ingestedMrs.filter((m) => m.url !== opts.sourceMrUrl), entry];
   }
   if (ingestedMrs.length > 0) manifestObject.ingestedMrs = ingestedMrs;
   const manifestContent = JSON.stringify(manifestObject, null, 2);
+  // The per-codebase sidecar is new output and may be replaced by a local
+  // symlink. Resolve it before writing so it cannot redirect metadata outside
+  // the teamwiki tree.
+  assertSafePath(projectManifestPath, [wikiRoot]);
   await writeFile(manifestPath, manifestContent, 'utf-8');
+  // Keep a copy with each codebase's evidence. A teamwiki may contain several
+  // imported repositories, while the legacy root manifest is overwritten by
+  // the most recently extracted one.
+  await writeFile(projectManifestPath, manifestContent, 'utf-8');
 
   const byKind: Record<string, number> = {};
-  for (const fact of facts) {
+  for (const fact of visibleFactsOf(facts)) {
     byKind[fact.kind] = (byKind[fact.kind] ?? 0) + 1;
   }
 
   const result: ExtractResult = {
     project,
     filesScanned: files.length,
-    facts: { total: facts.length, byKind },
+    facts: { total: visibleFactsOf(facts).length, byKind },
     graph: { nodes: repoGraph.nodes.length, edges: repoGraph.edges.length },
     incremental: !!opts.incremental && !!changedFiles,
     outputDir: wikiRoot,
@@ -938,4 +1172,5 @@ export async function extractCodebase(opts: ExtractCodebaseOptions): Promise<voi
       console.log(`  ${manifestNote}`);
     }
   }
+  return true;
 }

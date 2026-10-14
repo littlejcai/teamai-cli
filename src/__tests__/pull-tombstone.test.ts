@@ -4,7 +4,8 @@ import os from 'node:os';
 import fse from 'fs-extra';
 
 // Mock external dependencies
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
   loadState: vi.fn().mockResolvedValue({ lastPull: null }),
   saveState: vi.fn(),
@@ -18,7 +19,9 @@ vi.mock('../config.js', () => ({
 /** The rev `refreshTeamRepo` resolves for the fake team repo in these tests. */
 const { HEAD_REV } = vi.hoisted(() => ({ HEAD_REV: 'rev-unchanged' }));
 
-vi.mock('../utils/git.js', () => ({
+vi.mock('../utils/git.js', async (importOriginal) => ({
+  // The history proof of an unrecorded copy reads the team repo (#993).
+  createGit: (await importOriginal<typeof import('../utils/git.js')>()).createGit,
   pullRepo: vi.fn().mockResolvedValue('Already up to date.'),
   // Needed by the unchanged-rev fast path: without a rev, pull always does a
   // full sync and that branch is unreachable.
@@ -44,9 +47,11 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
-import { pull, cleanupInactiveNamespaceSkills } from '../pull.js';
+import { pull, cleanupInactiveNamespaceSkills, checkoutKey } from '../pull.js';
+import { fileHash } from '../utils/fs.js';
 import { loadLocalConfigForScope, loadTeamConfig, detectProjectConfig, loadStateForScope } from '../config.js';
 import type { TeamaiConfig, LocalConfig } from '../types.js';
+import { commitTeamRepo } from './helpers/team-repo-history.js';
 
 vi.mock('../roles.js', () => ({
   loadRolesManifest: vi.fn().mockResolvedValue({
@@ -92,6 +97,9 @@ vi.mock('../roles.js', () => ({
       agents: [],
     };
   }),
+  // The real class: resource-namespaces distinguishes an absent manifest from a
+  // malformed one by its type, so the mock has to carry the same identity.
+  RolesManifestNotFoundError: class RolesManifestNotFoundError extends Error {},
 }));
 
 // Isolation: pull() takes a real ~/.teamai/.sync-lock. Parallel vitest workers
@@ -174,6 +182,11 @@ describe('pull role-aware sync and cleanup', () => {
   });
 
   it('should clean up local rule files that are tombstoned', async () => {
+    // The rule teamai delivered, before the team removed it: with no record
+    // of the copies, the history proves them teamai's (#993).
+    await fse.writeFile(path.join(repoPath, 'rules', 'old-rule.md'), '# Old');
+    commitTeamRepo(repoPath, 'old-rule');
+    await fse.remove(path.join(repoPath, 'rules', 'old-rule.md'));
     // Tombstone for "old-rule"
     await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'old-rule\n');
 
@@ -187,7 +200,39 @@ describe('pull role-aware sync and cleanup', () => {
     expect(await fse.pathExists(path.join(homeDir, '.codex/rules', 'old-rule.md'))).toBe(false);
   });
 
+  it("cleans up a tombstoned rule's flat OMP copy on record, not a member's file of that name or a live root rule (#946)", async () => {
+    // The beforeEach config, mocked; OMP added.
+    const teamConfig = (await loadTeamConfig(repoPath))!;
+    vi.mocked(loadTeamConfig).mockResolvedValue({
+      ...teamConfig,
+      toolPaths: { ...teamConfig.toolPaths, omp: { rules: '.omp/rules', userScope: { rules: '.omp/agent/rules' } } },
+    });
+    const ompRules = path.join(homeDir, '.omp', 'agent', 'rules');
+    await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'fe/old\nbe/api\nfe/live\n');
+    await fse.writeFile(path.join(repoPath, 'rules', 'fe.live.md'), 'Live root rule.\n');
+    const recorded = path.join(ompRules, 'fe.old.md');
+    const mine = path.join(ompRules, 'be.api.md');
+    await fse.outputFile(recorded, '---\nalwaysApply: true\n---\n\nOld.\n');
+    await fse.outputFile(mine, 'My own dotted rule.\n');
+    const delivered = { [recorded]: (await fileHash(recorded))! };
+    vi.mocked(loadStateForScope).mockImplementation(async () => ({
+      lastPull: null,
+      lastPullByWorkspace: { [await checkoutKey(homeDir)]: { rev: 'old', targets: [], delivered } },
+    }) as unknown as Awaited<ReturnType<typeof loadStateForScope>>);
+
+    await pull({});
+
+    expect(await fse.pathExists(recorded)).toBe(false);
+    expect(await fse.readFile(mine, 'utf8')).toBe('My own dotted rule.\n');
+    expect(await fse.readFile(path.join(ompRules, 'fe.live.md'), 'utf8')).toBe('---\nalwaysApply: true\n---\n\nLive root rule.\n');
+  });
+
   it('should clean up local skill directories that are tombstoned', async () => {
+    // The skill teamai delivered, before the team removed it: with no record
+    // of the copies, the history proves them teamai's (#993).
+    await fse.outputFile(path.join(repoPath, 'skills', 'old-skill', 'SKILL.md'), '# Old');
+    commitTeamRepo(repoPath, 'old-skill');
+    await fse.remove(path.join(repoPath, 'skills', 'old-skill'));
     // Tombstone for "old-skill"
     await fse.writeFile(path.join(repoPath, 'skills', '.removed'), 'old-skill\n');
 
@@ -228,6 +273,11 @@ describe('pull role-aware sync and cleanup', () => {
   /** Writes a tombstone for `foo` plus one stale render per tool. */
   const seedTombstonedAgent = async (): Promise<void> => {
     await fse.ensureDir(path.join(repoPath, 'agents'));
+    // The legacy agent teamai delivered verbatim, before the team removed it:
+    // with no record of the copies, the history proves them teamai's (#993).
+    await fse.writeFile(path.join(repoPath, 'agents', 'foo.md'), 'stale');
+    commitTeamRepo(repoPath, 'foo');
+    await fse.remove(path.join(repoPath, 'agents', 'foo.md'));
     await fse.writeFile(path.join(repoPath, 'agents', '.removed'), 'foo\n');
 
     for (const [dir, file] of [
@@ -257,6 +307,22 @@ describe('pull role-aware sync and cleanup', () => {
     await expectAgentRendersGone();
   });
 
+  it('keeps a member\'s file of a tombstoned agent in a team-defined tool, and removes teamai\'s verbatim copy (#993)', async () => {
+    useAgentToolPaths();
+    const base = (await loadTeamConfig(repoPath))!;
+    vi.mocked(loadTeamConfig).mockResolvedValue({ ...base, toolPaths: { ...base.toolPaths, mytool: { agents: '.mytool/agents' } } });
+    await seedTombstonedAgent();
+    await fse.ensureDir(path.join(homeDir, '.mytool/agents'));
+    await fse.writeFile(path.join(homeDir, '.mytool/agents', 'foo.md'), 'MY OWN AGENT');
+
+    await pull({});
+
+    expect(await fse.readFile(path.join(homeDir, '.mytool/agents', 'foo.md'), 'utf8')).toBe('MY OWN AGENT');
+    await fse.writeFile(path.join(homeDir, '.mytool/agents', 'foo.md'), 'stale');
+    await pull({ force: true });
+    expect(await fse.pathExists(path.join(homeDir, '.mytool/agents', 'foo.md'))).toBe(false);
+  });
+
   it('should clean up tombstoned agents even when the repo rev is unchanged', async () => {
     // Regression for #576 on the upgrade path: a machine that pulled the
     // tombstone with the older CLI keeps the copies that CLI could not delete,
@@ -272,6 +338,59 @@ describe('pull role-aware sync and cleanup', () => {
     await pull({});
 
     await expectAgentRendersGone();
+  });
+
+  it('keeps teamai\'s instruction file when the team tombstoned a rule named teamai-context (#945)', async () => {
+    const base = (await loadTeamConfig(repoPath))!;
+    vi.mocked(loadTeamConfig).mockResolvedValue({ ...base, toolPaths: { cursor: { skills: '.cursor/skills', rules: '.cursor/rules' } } });
+    await fse.ensureDir(path.join(homeDir, '.cursor', 'skills'));
+    await fse.writeFile(path.join(repoPath, 'culture.md'), 'Be kind.\n');
+    await fse.writeFile(path.join(repoPath, 'rules', '.removed'), 'teamai-context\n');
+    const context = path.join(homeDir, '.cursor', 'rules', 'teamai-context.mdc');
+
+    await pull({});
+    expect(await fse.readFile(context, 'utf8')).toContain('Be kind.');
+    vi.mocked(loadStateForScope).mockImplementation(async () => ({
+      lastPull: null,
+      lastPullRev: HEAD_REV,
+      lastPullTargets: ['cursor'],
+    }) as Awaited<ReturnType<typeof loadStateForScope>>);
+    await pull({});
+
+    expect(await fse.readFile(context, 'utf8')).toContain('Be kind.');
+  });
+
+  it('reclaims an earlier release\'s teamai-context rule copy when the revision is unchanged (#945)', async () => {
+    const base = (await loadTeamConfig(repoPath))!;
+    vi.mocked(loadTeamConfig).mockResolvedValue({ ...base, toolPaths: { claude: { skills: '.claude/skills', rules: '.claude/rules' } } });
+    await fse.writeFile(path.join(repoPath, 'culture.md'), 'Be kind.\n');
+    await fse.writeFile(path.join(repoPath, 'rules', 'teamai-context.md'), '# Old team rule\n');
+    const context = path.join(homeDir, '.claude', 'rules', 'teamai-context.md');
+    await fse.copy(path.join(repoPath, 'rules', 'teamai-context.md'), context);
+    vi.mocked(loadStateForScope).mockImplementation(async () => ({
+      lastPull: null,
+      lastPullRev: HEAD_REV,
+      lastPullTargets: ['claude'],
+    }) as Awaited<ReturnType<typeof loadStateForScope>>);
+
+    await pull({});
+
+    expect(await fse.pathExists(context)).toBe(false);
+  });
+
+  it('reports no synced culture when every instruction target was left alone (#945)', async () => {
+    const { log } = await import('../utils/logger.js');
+    const base = (await loadTeamConfig(repoPath))!;
+    vi.mocked(loadTeamConfig).mockResolvedValue({ ...base, toolPaths: { cursor: { skills: '.cursor/skills', rules: '.cursor/rules' } } });
+    await fse.ensureDir(path.join(homeDir, '.cursor', 'skills'));
+    await fse.writeFile(path.join(repoPath, 'culture.md'), 'Be kind.\n');
+    // A member's own file holds teamai's target path.
+    await fse.outputFile(path.join(homeDir, '.cursor', 'rules', 'teamai-context.mdc'), '# Mine\n');
+    vi.mocked(log.success).mockClear();
+
+    await pull({});
+
+    expect(vi.mocked(log.success).mock.calls.flat()).not.toContain('Synced team culture');
   });
 
   it('should not delete files that are NOT tombstoned', async () => {
@@ -523,23 +642,40 @@ describe('pull role-aware sync and cleanup', () => {
     expect(await fse.pathExists(path.join(sk, 'scripts', '.git', 'HEAD'))).toBe(true);
   });
 
-  it('gracefully degrades when the roles manifest is malformed', async () => {
-    const { loadRolesManifest } = await import('../roles.js');
-    vi.mocked(loadRolesManifest).mockRejectedValueOnce(new Error('Invalid roles manifest'));
+  it('gracefully degrades when the roles manifest is absent', async () => {
+    const { loadRolesManifest, RolesManifestNotFoundError } = await import('../roles.js');
+    vi.mocked(loadRolesManifest).mockRejectedValueOnce(
+      new RolesManifestNotFoundError('/repo/manifest/roles.yaml'),
+    );
 
     await pull({});
 
     const { log } = await import('../utils/logger.js');
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Could not load roles manifest'));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('Roles manifest not found'));
   });
 
-  it('aborts pull when the same skill exists in multiple active namespaces', async () => {
+  it('fails the scope instead of delivering everything when the roles manifest is malformed', async () => {
+    // A manifest that exists but does not parse cannot degrade to "no filter":
+    // that hands out exactly the namespaces it was written to gate.
+    const { loadRolesManifest } = await import('../roles.js');
+    vi.mocked(loadRolesManifest).mockRejectedValueOnce(
+      new Error("Invalid roles manifest: roles.0.resources.skills.0: resource namespace must be a single path segment"),
+    );
+
+    await pull({});
+
+    // pull logs the manifest error and returns before any resource is written,
+    // which is what an invalid projects manifest already does.
+    const { log } = await import('../utils/logger.js');
+    expect(log.error).toHaveBeenCalledWith(expect.stringContaining('Invalid roles manifest'));
+  });
+
+  it('reports a collision when the same skill exists in multiple active namespaces', async () => {
     await fse.ensureDir(path.join(repoPath, 'skills', 'common', 'shared-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'common', 'shared-skill', 'SKILL.md'), '# Common');
     await fse.ensureDir(path.join(repoPath, 'skills', 'hai', 'shared-skill'));
     await fse.writeFile(path.join(repoPath, 'skills', 'hai', 'shared-skill', 'SKILL.md'), '# HAI');
 
-    const teamConfig = await vi.mocked(loadTeamConfig).mock.results.at(-1)?.value;
     const localConfig: LocalConfig = {
       repo: { localPath: repoPath, remote: 'https://git.woa.com/test/repo.git' },
       username: 'testuser',
@@ -549,12 +685,14 @@ describe('pull role-aware sync and cleanup', () => {
       resourceProfileVersion: 1,
       scope: 'user',
     };
-    const { scanRoleAwareSkills } = await import('../pull.js');
+    const { describeDeliveryConflict, scanRoleAwareSkills } = await import('../resources/desired.js');
 
-    await expect(scanRoleAwareSkills(
+    // pull stops skills for the run on this (#707); the other types still sync.
+    const result = await scanRoleAwareSkills(
       localConfig,
       { knowledge: ['common', 'hai'], skills: ['common', 'hai'], learnings: [], agents: [] },
-    )).rejects.toThrow(/Duplicate skill "shared-skill"/);
+    );
+    expect(result.kind === 'conflict' ? describeDeliveryConflict(result) : '').toMatch(/Duplicate skill "shared-skill"/);
   });
 
   it('cleans up stale skills after role change (full pull cycle)', async () => {

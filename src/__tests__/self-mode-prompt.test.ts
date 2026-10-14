@@ -6,6 +6,9 @@ vi.mock('../utils/logger.js', () => ({
 
 // Mock the prompt module so we control the interactive selection deterministically.
 vi.mock('../utils/prompt.js', () => ({
+  // Mirror the real predicate's TTY leg so tests that force `isTTY` keep
+  // driving the interactive branch, independent of CI=true on the runner.
+  isInteractive: () => Boolean(process.stdin.isTTY),
   askQuestion: vi.fn(),
   askConfirmation: vi.fn(),
   askSelection: vi.fn(),
@@ -68,11 +71,18 @@ describe('promptForSelfModeAgents — interactive Auto option', () => {
     expect(result).toEqual(['cursor']);
   });
 
-  it('offers exactly 7 options (Auto + 6 tools)', async () => {
+  it('offers exactly 10 options (Auto + 9 tools)', async () => {
     vi.mocked(askSelection).mockResolvedValueOnce([0]);
     await promptForSelfModeAgents({});
     const [, itemCount] = vi.mocked(askSelection).mock.calls[0];
-    expect(itemCount).toBe(7);
+    expect(itemCount).toBe(10);
+  });
+
+  it('offers Muse Code with its ~/.config/muse root', async () => {
+    vi.mocked(askSelection).mockResolvedValueOnce([0]);
+    await promptForSelfModeAgents({});
+    const printed = logSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(printed).toContain('10. Muse Code  (.config/muse)');
   });
 
   it('renders "none detected" when HOME has no known tools, and Auto → claude', async () => {

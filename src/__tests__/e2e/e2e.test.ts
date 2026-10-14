@@ -1,17 +1,14 @@
 import { describe, it, expect, beforeAll } from 'vitest';
-import { spawn } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
 
 // ─── Helpers ─────────────────────────────────────────────
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..', '..', '..');
 const CLI = path.join(ROOT, 'dist', 'index.js');
-
-const require = createRequire(import.meta.url);
 
 interface RunResult {
   code: number | null;
@@ -133,7 +130,7 @@ describe('tags CLI', () => {
 
   it('teamai tags list (no init) should show error', async () => {
     // Run in a temp dir with no teamai init
-    const { output, code } = await runCLI(['tags', 'list']);
+    const { output } = await runCLI(['tags', 'list']);
     // Either shows tags or shows "not initialized" error — both valid
     expect(output.length).toBeGreaterThan(0);
   });
@@ -183,11 +180,26 @@ describe('skill exclude CLI', () => {
       );
 
       const env = { HOME: sandbox };
+      const configPath = path.join(teamaiHome, 'config.yaml');
+      const statePath = path.join(teamaiHome, 'state.json');
+      const configBeforeAdd = fs.readFileSync(configPath, 'utf-8');
+      const stateBeforeAdd = fs.readFileSync(statePath, 'utf-8');
+      const previewAdd = await runCLIWithEnv(
+        ['skill', 'exclude', 'add', 'b-skill', 'a-skill', '--dry-run'],
+        env,
+        '',
+        sandbox,
+      );
+      expect(previewAdd.code, previewAdd.output).toBe(0);
+      expect(previewAdd.output).toContain('[dry-run] Would exclude: b-skill, a-skill');
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(configBeforeAdd);
+      expect(fs.readFileSync(statePath, 'utf-8')).toBe(stateBeforeAdd);
+
       const add = await runCLIWithEnv(['skill', 'exclude', 'add', 'b-skill', 'a-skill'], env, '', sandbox);
       expect(add.code, add.output).toBe(0);
       expect(add.output).toContain('Excluded: b-skill, a-skill');
 
-      const savedConfig = fs.readFileSync(path.join(teamaiHome, 'config.yaml'), 'utf-8');
+      const savedConfig = fs.readFileSync(configPath, 'utf-8');
       expect(savedConfig).toMatch(/excludedSkills:\n\s+- a-skill\n\s+- b-skill/);
       const invalidatedState = JSON.parse(fs.readFileSync(path.join(teamaiHome, 'state.json'), 'utf-8'));
       expect(invalidatedState.lastPullRev).toBeNull();
@@ -197,9 +209,22 @@ describe('skill exclude CLI', () => {
       expect(list.output).toContain('a-skill');
       expect(list.output).toContain('b-skill');
 
+      const configBeforeRemove = fs.readFileSync(configPath, 'utf-8');
+      const stateBeforeRemove = fs.readFileSync(statePath, 'utf-8');
+      const previewRemove = await runCLIWithEnv(
+        ['skill', 'exclude', 'remove', 'a-skill', 'b-skill', '--dry-run'],
+        env,
+        '',
+        sandbox,
+      );
+      expect(previewRemove.code, previewRemove.output).toBe(0);
+      expect(previewRemove.output).toContain('[dry-run] Would remove from exclude list: a-skill, b-skill');
+      expect(fs.readFileSync(configPath, 'utf-8')).toBe(configBeforeRemove);
+      expect(fs.readFileSync(statePath, 'utf-8')).toBe(stateBeforeRemove);
+
       const remove = await runCLIWithEnv(['skill', 'exclude', 'remove', 'a-skill', 'b-skill'], env, '', sandbox);
       expect(remove.code, remove.output).toBe(0);
-      const finalConfig = fs.readFileSync(path.join(teamaiHome, 'config.yaml'), 'utf-8');
+      const finalConfig = fs.readFileSync(configPath, 'utf-8');
       expect(finalConfig).not.toContain('excludedSkills');
     } finally {
       fs.rmSync(sandbox, { recursive: true, force: true });
@@ -255,13 +280,47 @@ describe('source code checks', () => {
 
 // ─── Remote E2E tests (require token + repo) ─────────────
 
+// The remote suite runs as the user-scope member of TEAMAI_TEST_REPO_URL. HOME
+// is the e2e sandbox (helpers/isolate-e2e-env.ts), so clone the team repo into
+// it and write the config there. Supports GitHub (TEAMAI_TEST_PROVIDER=github)
+// and TGit (default).
+function prepareRemoteTeamHome(): void {
+  const teamaiHome = path.join(process.env.HOME ?? '', '.teamai');
+  const repoPath = path.join(teamaiHome, 'team-repo');
+  const testRepoUrl = process.env.TEAMAI_TEST_REPO_URL ?? '';
+  const provider = (process.env.TEAMAI_TEST_PROVIDER ?? 'tgit').toLowerCase();
+  const defaultHost = provider === 'github' ? 'github.com' : 'git.woa.com';
+  const cloneUrl = testRepoUrl.startsWith('http')
+    ? testRepoUrl
+    : `https://${defaultHost}/${testRepoUrl}.git`;
+  const cloneCmd =
+    provider === 'github'
+      ? `git clone "https://x-access-token:${process.env.TEAMAI_TEST_TOKEN}@${cloneUrl.replace(/^https?:\/\//, '')}" "${repoPath}"`
+      : `git clone -c "http.extraHeader=PRIVATE-TOKEN: ${process.env.TEAMAI_TEST_TOKEN}" "${cloneUrl}" "${repoPath}"`;
+
+  fs.mkdirSync(teamaiHome, { recursive: true });
+  execSync(cloneCmd, { stdio: 'pipe' });
+  fs.writeFileSync(
+    path.join(teamaiHome, 'config.yaml'),
+    [
+      `repo:`,
+      `  localPath: ${repoPath}`,
+      `  remote: ${testRepoUrl}`,
+      `username: ci`,
+      `updatePolicy: auto`,
+    ].join('\n'),
+  );
+}
+
 describe('remote commands', () => {
   beforeAll(() => {
     if (!CAN_RUN_REMOTE) {
       console.log(
         '⏭  Skipping remote E2E tests: TEAMAI_TEST_TOKEN or TEAMAI_TEST_REPO_URL not set',
       );
+      return;
     }
+    prepareRemoteTeamHome();
   });
 
   it.skipIf(!CAN_RUN_REMOTE)(
@@ -596,37 +655,8 @@ describe('remote commands', () => {
       const teamaiHome = path.join(process.env.HOME ?? '', '.teamai');
       expect(fs.existsSync(path.join(teamaiHome, 'config.yaml'))).toBe(false);
 
-      // Step 3: Restore for subsequent CI steps — write minimal config + clone repo
-      const testRepoUrl = process.env.TEAMAI_TEST_REPO_URL ?? '';
-      const repoPath = path.join(teamaiHome, 'team-repo');
-      fs.mkdirSync(teamaiHome, { recursive: true });
-
-      // Clone the repo back (uninstall removed it).
-      // Supports both GitHub (via TEAMAI_TEST_PROVIDER=github) and TGit (default).
-      const { execSync } = await import('node:child_process');
-      const provider = (process.env.TEAMAI_TEST_PROVIDER ?? 'tgit').toLowerCase();
-      const defaultHost = provider === 'github' ? 'github.com' : 'git.woa.com';
-      const cloneUrl = testRepoUrl.startsWith('http')
-        ? testRepoUrl
-        : `https://${defaultHost}/${testRepoUrl}.git`;
-
-      const cloneCmd =
-        provider === 'github'
-          ? `git clone "https://x-access-token:${process.env.TEAMAI_TEST_TOKEN}@${cloneUrl.replace(/^https?:\/\//, '')}" "${repoPath}"`
-          : `git clone -c "http.extraHeader=PRIVATE-TOKEN: ${process.env.TEAMAI_TEST_TOKEN}" "${cloneUrl}" "${repoPath}"`;
-
-      execSync(cloneCmd, { stdio: 'pipe' });
-
-      fs.writeFileSync(
-        path.join(teamaiHome, 'config.yaml'),
-        [
-          `repo:`,
-          `  localPath: ${repoPath}`,
-          `  remote: ${testRepoUrl}`,
-          `username: ci`,
-          `updatePolicy: auto`,
-        ].join('\n'),
-      );
+      // Step 3: Restore for subsequent tests (uninstall removed the clone)
+      prepareRemoteTeamHome();
 
       // Verify pull works after restore (may sync skills or report no resources depending on test repo)
       const pullResult = await runCLI(['pull']);
@@ -702,10 +732,13 @@ describe('remote commands', () => {
 // of the suite depends on.
 //
 // GitHub-only: TGit's `gf` CLI authenticates via ~/.netrc, which we lose
-// when we isolate $HOME to a temp dir. `gf auth login` then triggers an
-// interactive (inheritStdio) login that no amount of stdin piping can
-// satisfy → permanent hang. GitHub provider auths via GITHUB_TOKEN env,
-// so it works fine under HOME isolation.
+// when we isolate $HOME to a temp dir, and `gf auth whoami` reads only that
+// store. The TGIT_TOKEN below cannot stand in for it: the PAT is REST-only,
+// and git.woa.com's git endpoint rejects it too. Since #711 the CLI
+// refuses to start `gf auth login` without a terminal instead of hanging on
+// it, so a TGit run here would fail fast rather than block; it still cannot
+// pass. GitHub provider auths via GITHUB_TOKEN env, so it works fine under
+// HOME isolation.
 
 const PROVIDER_IS_GITHUB =
   (process.env.TEAMAI_TEST_PROVIDER ?? 'tgit').toLowerCase() === 'github';
@@ -764,8 +797,8 @@ describe('init project scope (sandboxed)', () => {
         );
         expect(cfg).toContain('repo:');
         expect(cfg).toContain('localPath');
-        expect(cfg).toMatch(/scope:\s*project/);
-        expect(result.output).toMatch(/Scope: project/);
+        expect(cfg).toMatch(/scope:\s*workspace/);
+        expect(result.output).toMatch(/Scope: workspace/);
       } finally {
         fs.rmSync(homeSandbox, { recursive: true, force: true });
       }

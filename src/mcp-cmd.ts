@@ -1,18 +1,27 @@
 import path from 'node:path';
 import { autoDetectInit } from './config.js';
-import { parseTeamMcpServers } from './resources/mcp.js';
+import { mcpEntryReader, teamMcpToDef } from './resources/mcp.js';
+import { describeEntryFailure, describeOrigin, reportUndeliveredEntryNotices, resolveEntriesFor } from './namespaced-entries.js';
 import {
   reconcileMcpForConfig,
+  releaseCleanMcpGitExcludes,
   resolveMcpTargets,
-  buildVarTable,
+  buildDesiredMcpContext,
+  desiredMcpForTarget,
+  mcpTargetExcluded,
+  shadowedMcpRecords,
+  readMcpManifest,
+  mcpManifestKey,
+  describeMcpLocation,
   type McpChange,
+  type McpTarget,
 } from './mcp-reconcile.js';
-import { referencedVars } from './resources/mcp-format.js';
+import { placeholderValue, referencedVars } from './resources/mcp-format.js';
+import { reportMissingSecrets } from './env-advisories.js';
+import { resolvesTeamEnv, resolveTeamEnv } from './env-resolution.js';
+import { carriesResolvedValue, ensureExcludedFromGit } from './mcp-git-exclude.js';
 import { log } from './utils/logger.js';
 import type { GlobalOptions } from './types.js';
-import { managedMcpManifestPath, managedMcpManifestKey, getDataHome } from './types.js';
-import { readJson } from './utils/fs.js';
-import type { ManagedMcpManifest } from './types.js';
 import { getUserHome } from './utils/home.js';
 
 function displayPath(p: string): string {
@@ -23,44 +32,75 @@ function displayPath(p: string): string {
 
 /** Print team MCP servers, their secret requirements, and where they are installed. */
 export async function mcpList(_options: GlobalOptions): Promise<void> {
-  const { localConfig, teamConfig } = await autoDetectInit();
-  const servers = await parseTeamMcpServers(localConfig.repo.localPath);
+  // Read-only: the load never persists a migration (#893).
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: true });
+  const resolution = await resolveEntriesFor(mcpEntryReader, localConfig);
+  if (resolution.kind === 'failed') {
+    reportUndeliveredEntryNotices(resolution);
+    log.error(describeEntryFailure(resolution.failure));
+    process.exitCode = 1;
+    return;
+  }
+  // A server an unknown or removed key takes out of the delivered set never
+  // appears in the list below, so say why it is missing (#822).
+  reportUndeliveredEntryNotices(resolution);
+  const servers = resolution.entries;
+
+  // HTTP mode has no repo tree to declare secrets in; a project that inherits the user scope has the user scope's.
+  const teamEnv = resolvesTeamEnv(localConfig) ? await resolveTeamEnv(localConfig) : undefined;
+  // A failed declaration is not "no secrets" (#879 Conflict 14): nothing says
+  // which of a server's variables are secrets, so none is called set.
+  const declarationsFailed = teamEnv?.declarations.kind === 'failed';
+  if (teamEnv?.declarations.kind === 'failed') {
+    log.error(describeEntryFailure(teamEnv.declarations.failure));
+    process.exitCode = 1;
+  }
 
   if (servers.length === 0) {
-    log.info('No team MCP servers defined (mcp/mcp.yaml not found or empty)');
+    log.info('No team MCP servers reach this directory (mcp/mcp.yaml and active mcp/<ns>/mcp.yaml files are absent or empty)');
+    await reportMissingSecrets(localConfig, teamEnv);
     return;
   }
 
   const targets = await resolveMcpTargets(teamConfig, localConfig);
-  const vars = await buildVarTable(localConfig);
-  // Project scope reads THIS worktree's own per-worktree manifest; user the global file.
-  const manifest = (await readJson<ManagedMcpManifest>(
-    managedMcpManifestPath(
-      getDataHome(localConfig),
-      localConfig.scope === 'project' ? localConfig.projectRoot : undefined,
-    ),
-  )) ?? {};
+  // The team env already resolved above: resolving it again repeats its warnings.
+  const desiredContext = await buildDesiredMcpContext(teamConfig, localConfig, { teamEnv });
+  const { vars } = desiredContext;
+  // Project scope reads THIS worktree's own per-worktree manifest, and the local scopes' records (#915); user the global file.
+  const manifest = await readMcpManifest(localConfig);
 
-  console.log(`Team MCP servers — mcp/mcp.yaml (${servers.length}):`);
+  console.log(`Team MCP servers — mcp/ (${servers.length}):`);
   console.log('');
-  for (const s of servers) {
+  for (const resolved of servers) {
+    const s = teamMcpToDef(resolved.entry);
     const endpoint = s.transport === 'stdio' ? `${s.command} ${(s.args ?? []).join(' ')}`.trim() : s.url;
     console.log(`  ${s.name}  [${s.transport}]`);
     if (s.description) console.log(`    ${s.description}`);
     console.log(`    endpoint: ${endpoint}`);
-    if (s.roles) console.log(`    roles:    ${s.roles.length > 0 ? s.roles.join(', ') : 'nobody'}`);
+    console.log(`    from:     ${resolved.source} (${describeOrigin(resolved)})`);
+    const roles = resolved.entry.roles;
+    if (roles) console.log(`    roles:    ${roles.length > 0 ? roles.join(', ') : 'nobody'} (deprecated)`);
 
     const needed = referencedVars(s);
     if (needed.length > 0) {
-      const missing = needed.filter((v) => !vars[v]);
-      const state = missing.length === 0 ? 'all set' : `MISSING: ${missing.join(', ')}`;
+      const missing = needed.filter((v) => !placeholderValue(vars, v));
+      const state = declarationsFailed ? 'not resolved' : missing.length === 0 ? 'all set' : `MISSING: ${missing.join(', ')}`;
       console.log(`    secrets:  ${needed.join(', ')} (${state})`);
     }
 
-    const installedIn = targets
-      .filter((t) => (manifest[managedMcpManifestKey(t.tool, t.projectScope)] ?? []).some((r) => r.name === s.name))
-      .map((t) => t.tool);
+    const installed = (t: McpTarget): boolean =>
+      (manifest[mcpManifestKey(t)] ?? []).some((r) => r.name === s.name);
+    const installedIn = targets.filter(installed).map((t) => t.tool);
     console.log(`    installed: ${installedIn.length > 0 ? installedIn.join(', ') : '(none)'}`);
+    // Pull writes a resolved value only into a file git leaves out of a commit
+    // (#882); an entry an earlier pull wrote there stays as it was. Only where
+    // delivery would write it: its tools, transport, policy and requirements.
+    for (const t of targets) {
+      if (mcpTargetExcluded(localConfig, t)) continue;
+      if (!carriesResolvedValue(t, [s], desiredMcpForTarget(t, [s], desiredContext).desired.keys())) continue;
+      const exclusion = await ensureExcludedFromGit(t.file, { dryRun: true });
+      if (exclusion.kind === 'failed') console.log(`    withheld: ${t.tool} — ${exclusion.reason}. ${exclusion.fix}`);
+    }
     console.log('');
   }
 
@@ -68,8 +108,16 @@ export async function mcpList(_options: GlobalOptions): Promise<void> {
   if (targets.length === 0) {
     console.log('  (none)');
   } else {
-    for (const t of targets) console.log(`  ${t.tool.padEnd(16)} ${displayPath(t.file)}`);
+    for (const t of targets) {
+      console.log(`  ${t.tool.padEnd(16)} ${describeMcpLocation({ ...t, file: displayPath(t.file) })}`);
+      // The tool reads only the first of its user MCP files that exists (#993).
+      for (const [file, names] of await shadowedMcpRecords(localConfig, t)) {
+        console.log(`  ${''.padEnd(16)} teamai's ${names.join(', ')} ${names.length > 1 ? 'are' : 'is'} still in ${displayPath(file)}, `
+          + `which ${t.tool} does not read: run \`teamai pull\` to move ${names.length > 1 ? 'them' : 'it'}.`);
+      }
+    }
   }
+  await reportMissingSecrets(localConfig, teamEnv);
 }
 
 function reportChanges(changes: McpChange[]): void {
@@ -85,11 +133,16 @@ function reportChanges(changes: McpChange[]): void {
 export async function mcpInject(
   options: GlobalOptions & { dryRun?: boolean; force?: boolean },
 ): Promise<void> {
-  const { localConfig, teamConfig } = await autoDetectInit();
-  const { changes, wrote } = await reconcileMcpForConfig(teamConfig, localConfig, {
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  const { changes, wrote, unresolved } = await reconcileMcpForConfig(teamConfig, localConfig, {
     dryRun: options.dryRun,
     force: options.force,
   });
+  // The reason is already reported, and every installed server left as it was.
+  if (unresolved) {
+    process.exitCode = 1;
+    return;
+  }
 
   console.log(options.dryRun ? 'MCP inject (dry run):' : 'MCP inject:');
   reportChanges(changes);
@@ -98,13 +151,18 @@ export async function mcpInject(
   else if (!options.dryRun) log.info('Already up to date.');
 }
 
-export async function mcpRemove(_options: GlobalOptions): Promise<void> {
-  const { localConfig, teamConfig } = await autoDetectInit();
-  const { changes, wrote } = await reconcileMcpForConfig(teamConfig, localConfig, { removeAll: true });
+export async function mcpRemove(options: GlobalOptions): Promise<void> {
+  const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+  const { changes, wrote } = await reconcileMcpForConfig(teamConfig, localConfig, {
+    removeAll: true,
+    dryRun: options.dryRun,
+  });
+  // Nothing of teamai's is left for .git/info/exclude to protect (#882).
+  if (!options.dryRun) await releaseCleanMcpGitExcludes(teamConfig, localConfig);
 
-  console.log('MCP remove:');
+  console.log(options.dryRun ? 'MCP remove (dry run):' : 'MCP remove:');
   reportChanges(changes);
 
   if (wrote) log.success('teamai-managed MCP servers removed.');
-  else log.info('Nothing to remove.');
+  else if (!options.dryRun) log.info('Nothing to remove.');
 }

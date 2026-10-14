@@ -5,6 +5,8 @@ import {
   computeDailyStatsDelta,
   mergeDailyStats,
   summarizeTrendWindow,
+  takeDailySession,
+  type DailySessionSnapshot,
 } from '../session-trends.js';
 import type { DashboardEvent, DailyUserStats } from '../types.js';
 
@@ -33,6 +35,9 @@ describe('daily session trends', () => {
       succeeded: 1,
       corrected: 0,
       requestDaily: { '2026-09-01': { pricedRequests: 1, costMicros: 530 } },
+      // Session-level cache tokens come straight from the transcript, independent of pricing.
+      sessionCacheReadTokens: 300,
+      sessionCacheEligibleTokens: 440, // 100 input + 300 cacheRead + 40 cacheCreation
     });
   });
 
@@ -82,6 +87,62 @@ describe('daily session trends', () => {
     // double-subtract: the delta settles back to 0 once the baseline catches up.
     const third = computeDailyStatsDelta(interrupted, second.nextReported);
     expect(third.delta['2026-09-02']).toMatchObject({ sessionsEnded: 0, sessionsSucceeded: 0 });
+  });
+
+  it('counts cache-read share even when the session was never priced (gateway alias)', () => {
+    // A gateway-alias session: real token counts, but no requestDaily (pricing failed).
+    const sessions = new Map([
+      ['s1', { date: '2026-09-02', prompts: 1, durationMs: 60_000, succeeded: 1 as const, corrected: 0 as const,
+        requestDaily: {}, sessionCacheReadTokens: 300, sessionCacheEligibleTokens: 400 }],
+    ]);
+    const { delta } = computeDailyStatsDelta(sessions, {});
+    expect(delta['2026-09-02']).toMatchObject({ cacheReadTokens: 300, cacheEligibleInputTokens: 400, pricedRequests: 0, costMicros: 0 });
+    const summary = summarizeTrendWindow(mergeDailyStats(undefined, delta), new Date('2026-09-03T12:00:00Z'));
+    expect(summary.current.cacheReadShare).toBe(0.75); // 300/400, independent of cost
+    expect(summary.current.avgRequestCostMicros).toBeNull(); // no priced requests
+  });
+
+  it('does not double-count session cache tokens across idempotent re-reports', () => {
+    const snap = { date: '2026-09-02', prompts: 1, durationMs: 60_000, succeeded: 1 as const, corrected: 0 as const,
+      requestDaily: {}, sessionCacheReadTokens: 300, sessionCacheEligibleTokens: 400 };
+    const first = computeDailyStatsDelta(new Map([['s1', snap]]), {});
+    expect(first.delta['2026-09-02']).toMatchObject({ cacheReadTokens: 300, cacheEligibleInputTokens: 400 });
+    // Re-report the identical cumulative snapshot: cache delta must settle to 0.
+    const second = computeDailyStatsDelta(new Map([['s1', snap]]), first.nextReported);
+    expect(second.delta['2026-09-02']).toMatchObject({ cacheReadTokens: 0, cacheEligibleInputTokens: 0 });
+  });
+
+  it('does not re-add cache tokens for a session first reported under the old (requestDaily) shape', () => {
+    // Legacy previous snapshot: cache only in requestDaily, no sessionCache* fields.
+    const legacyReported = {
+      s1: { date: '2026-09-02', prompts: 1, durationMs: 60_000, succeeded: 1 as const, corrected: 0 as const,
+        requestDaily: { '2026-09-01': { pricedRequests: 1, costMicros: 100, cacheReadTokens: 300, cacheEligibleInputTokens: 400, priceVersion: 'v1' } } },
+    };
+    // Current snapshot now carries the same tokens as sessionCache* fields.
+    const current = new Map([
+      ['s1', { ...legacyReported.s1, sessionCacheReadTokens: 300, sessionCacheEligibleTokens: 400 }],
+    ]);
+    const { delta } = computeDailyStatsDelta(current, legacyReported);
+    // Baseline reconstructed from requestDaily → no re-add.
+    expect(delta['2026-09-02']).toMatchObject({ cacheReadTokens: 0, cacheEligibleInputTokens: 0 });
+  });
+
+  it('a run taking its share of an earlier release\'s sum reports no status change of its own', () => {
+    // Two reported runs of one ID, one successful and one interrupted: the sum is
+    // unsuccessful, but each run keeps its own status, so neither moves the totals.
+    const day = '2026-09-01';
+    const snapshot = (prompts: number, succeeded: 0 | 1, corrected: 0 | 1): DailySessionSnapshot =>
+      ({ date: day, prompts, durationMs: 1000, succeeded, corrected, requestDaily: {} });
+    const runs = new Map([['pid-1@t1', snapshot(1, 1, 0)], ['pid-1@t2', snapshot(1, 0, 1)]]);
+    let left = snapshot(2, 0, 1);
+    const reported: Record<string, DailySessionSnapshot> = {};
+    for (const [runId, run] of runs) {
+      const share = takeDailySession(run, left);
+      reported[runId] = share.taken;
+      left = share.left;
+    }
+    const { delta } = computeDailyStatsDelta(runs, reported);
+    expect(delta[day]).toMatchObject({ sessionsEnded: 0, sessionsSucceeded: 0, sessionsCorrected: 0, promptTurns: 0 });
   });
 
   it('compares the latest seven UTC days with the prior seven days', () => {

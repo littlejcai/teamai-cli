@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -61,7 +62,7 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       throw new Error(`CLI binary not found at ${CLI}. Run "npm run build" first.`);
     }
 
-    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-project-e2e-'));
+    const sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-source-project-e2e-')));
     try {
       const home = path.join(sandbox, 'home');
       const projectRoot = path.join(sandbox, 'project');
@@ -142,6 +143,13 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
         GIT_CONFIG_VALUE_1: 'always',
       };
 
+      const beforeAdd = fs.readFileSync(path.join(teamRepo, 'teamai.yaml'), 'utf8');
+      const addPreview = await runCLI(['source', 'add', sourceUrl, '--name', 'beta-source', '--dry-run'], projectRoot, home, sourceGitEnv);
+      expect(addPreview.code, addPreview.output).toBe(0);
+      expect(addPreview.output).toContain('[dry-run] Would add source "beta-source"');
+      expect(fs.readFileSync(path.join(teamRepo, 'teamai.yaml'), 'utf8')).toBe(beforeAdd);
+      expect(fs.existsSync(path.join(home, '.teamai', 'sources'))).toBe(false);
+
       const addResult = await runCLI(
         ['source', 'add', sourceUrl, '--name', 'beta-source'],
         projectRoot,
@@ -181,9 +189,114 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
         ),
       ).toContain('# External beta skill');
 
-      const manifestPath = path.join(home, '.teamai', 'sources', 'beta-source', 'installed.json');
+      const installationId = createHash('sha256').update(JSON.stringify([projectRoot, teamRepo])).digest('hex');
+      const manifestPath = path.join(home, '.teamai', 'sources', 'beta-source', 'installations', `${installationId}.json`);
       expect(JSON.parse(fs.readFileSync(manifestPath, 'utf8')).installedSkills)
         .toEqual(['external-beta-skill']);
+
+      const repoId = createHash('sha256').update(sourceUrl).digest('hex');
+      const cacheStamp = path.join(home, '.teamai', 'source-repos', repoId, 'last-pull.json');
+      const expiredStamp = JSON.stringify({ lastPull: new Date(0).toISOString() });
+      fs.writeFileSync(cacheStamp, expiredStamp);
+      for (const args of [['source', 'browse', 'beta-source', '--dry-run'], ['pull', '--force', '--dry-run']]) {
+        const preview = await runCLI(args, projectRoot, home, sourceGitEnv);
+        expect(preview.code, preview.output).toBe(0);
+        expect(preview.output).toContain('Would refresh the cached repository');
+        expect(fs.readFileSync(cacheStamp, 'utf8')).toBe(expiredStamp);
+      }
+
+      const manifestBytes = fs.readFileSync(manifestPath, 'utf8');
+      const configBytes = fs.readFileSync(teamYamlPath, 'utf8');
+      const sourceLock = path.join(home, '.teamai', '.source-lifecycle-lock');
+      const lockBytes = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), owner: 'e2e-holder' });
+      fs.writeFileSync(sourceLock, lockBytes);
+      for (const args of [
+        ['source', 'remove', 'beta-source'],
+        ['source', 'remove', 'beta-source', '--dry-run'],
+        ['source', 'add', sourceUrl, '--name', 'blocked-source'],
+        ['source', 'browse', 'beta-source'],
+      ]) {
+        const blocked = await runCLI(args, projectRoot, home, sourceGitEnv);
+        expect(blocked.code, blocked.output).not.toBe(0);
+        expect(blocked.output).toContain('Could not acquire the shared source lock');
+        expect(fs.readFileSync(sourceLock, 'utf8')).toBe(lockBytes);
+        expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBytes);
+        expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+      }
+      fs.rmSync(sourceLock);
+      const invalid = await runCLI(['source', 'remove', '..'], projectRoot, home, sourceGitEnv);
+      expect(invalid.code, invalid.output).not.toBe(0);
+      expect(fs.existsSync(sourceLock)).toBe(false);
+      expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBytes);
+      expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+
+      const savedManifest = JSON.parse(manifestBytes);
+      const unsafeManifests = [
+        ...['', '.', 'nested/..', '../outside', projectRoot].map((unsafePath) => ({
+          ...savedManifest, installedPaths: { 'external-beta-skill': [unsafePath] },
+        })),
+        ...['..', '../..', '/absolute'].map((unsafeName) => ({
+          ...savedManifest, installedSkills: [unsafeName], installedPaths: undefined,
+        })),
+      ];
+      for (const unsafeManifest of unsafeManifests) {
+        const invalidBytes = JSON.stringify(unsafeManifest);
+        fs.writeFileSync(manifestPath, invalidBytes);
+        const blocked = await runCLI(['source', 'remove', 'beta-source'], projectRoot, home, sourceGitEnv);
+        expect(blocked.code, blocked.output).not.toBe(0);
+        expect(blocked.output).toContain('Invalid source ownership record');
+        expect(fs.existsSync(sourceLock)).toBe(false);
+        expect(fs.readFileSync(manifestPath, 'utf8')).toBe(invalidBytes);
+        expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+        expect(fs.existsSync(path.join(projectRoot, '.claude/skills/external-beta-skill/SKILL.md'))).toBe(true);
+      }
+      fs.writeFileSync(manifestPath, manifestBytes);
+
+      // Foreign ownership is part of the removal preflight, before editing YAML.
+      const invalidPeer = path.join(path.dirname(manifestPath), 'invalid-peer.json');
+      for (const peerBytes of ['{truncated', JSON.stringify({ installedSkills: 42 })]) {
+        fs.writeFileSync(invalidPeer, peerBytes);
+        const blocked = await runCLI(['source', 'remove', 'beta-source'], projectRoot, home, sourceGitEnv);
+        expect(blocked.code, blocked.output).not.toBe(0);
+        expect(blocked.output).toContain('source ownership record');
+        expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+        expect(fs.readFileSync(manifestPath, 'utf8')).toBe(manifestBytes);
+        expect(fs.readFileSync(invalidPeer, 'utf8')).toBe(peerBytes);
+        expect(fs.existsSync(path.join(projectRoot, '.claude/skills/external-beta-skill/SKILL.md'))).toBe(true);
+        expect(fs.existsSync(sourceLock)).toBe(false);
+      }
+      fs.rmSync(invalidPeer);
+      const rootLink = path.join(projectRoot, '.source-root-link');
+      fs.symlinkSync(path.dirname(projectRoot), rootLink, 'dir');
+      const rootRoute = `.source-root-link/${path.basename(projectRoot)}`;
+      fs.writeFileSync(manifestPath, JSON.stringify({ ...savedManifest, installedPaths: { 'external-beta-skill': [rootRoute] }, installedPhysicalPaths: { [rootRoute]: fs.realpathSync(projectRoot) } }));
+      const blockedRoot = await runCLI(['source', 'remove', 'beta-source'], projectRoot, home, sourceGitEnv);
+      expect(blockedRoot.code, blockedRoot.output).not.toBe(0);
+      expect(blockedRoot.output).toContain('Refusing to remove a source destination root');
+      expect(fs.readFileSync(teamYamlPath, 'utf8')).toBe(configBytes);
+      expect(fs.existsSync(rootLink)).toBe(true);
+      expect(fs.existsSync(sourceLock)).toBe(false);
+      fs.unlinkSync(rootLink);
+      fs.writeFileSync(manifestPath, manifestBytes);
+
+      // A prior source claim cannot delete a directory now owned by the team
+      // or a builtin, even when the old source used a canonical nested name.
+      const protectedScripts: string[] = [];
+      const removalManifest = JSON.parse(manifestBytes);
+      fs.mkdirSync(path.join(teamRepo, 'skills/team-root'), { recursive: true });
+      fs.writeFileSync(path.join(teamRepo, 'skills/team-root/SKILL.md'), '# Team-owned skill\n');
+      for (const owner of ['team-root', 'teamai']) {
+        const name = `${owner}/scripts`;
+        const relativePath = `.claude/skills/${name}`;
+        const script = path.join(projectRoot, relativePath, 'run.sh');
+        fs.mkdirSync(path.dirname(script), { recursive: true });
+        fs.writeFileSync(script, '# Preserve team/builtin script\n');
+        protectedScripts.push(script);
+        removalManifest.installedSkills.push(name);
+        removalManifest.installedPaths[name] = [relativePath];
+        removalManifest.installedPhysicalPaths[relativePath] = fs.realpathSync(path.dirname(script));
+      }
+      fs.writeFileSync(manifestPath, JSON.stringify(removalManifest));
 
       const removeResult = await runCLI(
         ['source', 'remove', 'beta-source'],
@@ -194,7 +307,13 @@ describe('project-scope source lifecycle e2e (issue #335)', () => {
       expect(removeResult.code, removeResult.output).toBe(0);
       expect(removeResult.output).toContain('Removed source "beta-source"');
       expect(YAML.parse(fs.readFileSync(teamYamlPath, 'utf8')).sources).toEqual([]);
-      expect(fs.existsSync(path.dirname(manifestPath))).toBe(false);
+      for (const script of protectedScripts) expect(fs.readFileSync(script, 'utf8')).toBe('# Preserve team/builtin script\n');
+      expect(removeResult.output).toContain('Retained source ownership');
+      const retainedManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      expect(retainedManifest.installedSkills).toEqual(['team-root/scripts', 'teamai/scripts']);
+      expect(retainedManifest.installedPaths).not.toHaveProperty('external-beta-skill');
+      expect(fs.existsSync(sourceLock)).toBe(false);
+      expect(fs.existsSync(path.join(home, '.teamai', 'source-repos', repoId, 'repo'))).toBe(true);
       expect(
         fs.existsSync(path.join(projectRoot, '.claude', 'skills', 'external-beta-skill')),
       ).toBe(false);

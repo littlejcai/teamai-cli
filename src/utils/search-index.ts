@@ -1,10 +1,17 @@
 import path from 'node:path';
+import { readFile, readdir, rm } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
 import matter from 'gray-matter';
-import { readFileSafe, readJson, writeJson, listFiles, listFilesRecursive, listDirs, pathExists } from './fs.js';
+import { expandHome, readFileSafe, readJson, writeJsonAtomic, listFiles, pathExists, isIgnored } from './fs.js';
 import { tokenize, wordSegments, MAX_TOKENIZE_CHARS } from './tokenizer.js';
 import { log } from './logger.js';
+import { teamRuleBody, teamRuleData } from '../resources/team-rule.js';
 import {
   SEARCH_INDEX_VERSION,
+  getDataHome,
+  getProjectSearchIndexPath,
+  isSelfMode,
+  type LocalConfig,
   type KnowledgeDomain,
   type LearningDocMeta,
   type SearchIndex,
@@ -14,6 +21,52 @@ import {
   type KnowledgeType,
 } from '../types.js';
 import { getUserHome } from './home.js';
+import { isSafeNamespaceSegment } from '../manifest-schema.js';
+
+/**
+ * Self mode keeps one index per checkout, but every checkout shares the
+ * learnings checkout and the queue, so a rebuild in one leaves the others'
+ * indexes without what it just published or pulled (#808). Drop the other
+ * checkouts' indexes in this partition; recall rebuilds a missing one from
+ * that checkout's own roots. Only `search-index.json` files are touched.
+ */
+export async function dropOtherCheckoutIndexes(localConfig: LocalConfig): Promise<void> {
+  if (!isSelfMode(localConfig)) return;
+  await dropCheckoutIndexes(getDataHome(localConfig), getProjectSearchIndexPath(localConfig));
+}
+
+/**
+ * Drop every per-checkout index under a self-mode data home, except `keep`.
+ * Also used when the migration moves queued learnings into the shared queue.
+ */
+export async function dropCheckoutIndexes(dataHome: string, keep?: string): Promise<void> {
+  const workspaces = path.join(dataHome, 'workspaces');
+  let entries: Dirent[];
+  try {
+    entries = await readdir(workspaces, { withFileTypes: true });
+  } catch (e) {
+    if (e instanceof Error && 'code' in e && e.code === 'ENOENT') return;
+    throw e;
+  }
+  await Promise.all(
+    entries
+      // One directory per checkout; a stray file (`.DS_Store`) has no index.
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(workspaces, entry.name, 'search-index.json'))
+      .filter((indexPath) => indexPath !== keep)
+      .map((indexPath) => rm(indexPath, { force: true })),
+  );
+}
+
+/**
+ * Drop every project search index in a data home: the shared one and each
+ * checkout's. For a re-init that changes the install's kind, which keeps the
+ * data home but not the repository its indexes were built from (#808).
+ */
+export async function dropAllSearchIndexes(dataHome: string): Promise<void> {
+  await rm(path.join(dataHome, 'search-index.json'), { force: true });
+  await dropCheckoutIndexes(dataHome);
+}
 
 /** Resolve search index path dynamically (respects HOME changes in tests). */
 function getSearchIndexPath(): string {
@@ -244,33 +297,34 @@ export function parseLearningDoc(
 ): { meta: LearningDocMeta; bodyExcerpt: string } | null {
   if (!content.trim()) return null;
 
+  let data: Record<string, unknown>;
+  let body: string;
   try {
-    const { data, content: body } = matter(content);
-    const meta: LearningDocMeta = {
-      title: typeof data.title === 'string' ? data.title : undefined,
-      author: typeof data.author === 'string' ? data.author : undefined,
-      date: typeof data.date === 'string'
-        ? data.date
-        : data.date instanceof Date
-          ? data.date.toISOString().slice(0, 10)
-          : undefined,
-      tags: Array.isArray(data.tags)
-        ? data.tags.filter((t: unknown) => typeof t === 'string')
-        : typeof data.Tags === 'string'
-          ? data.Tags.split(/[,，]\s*/).map((t: string) => t.trim()).filter(Boolean)
-          : undefined,
-    };
-
-    const bodyExcerpt = body;
-    return { meta, bodyExcerpt };
+    ({ data, content: body } = matter(content));
   } catch {
-    // Fallback: treat entire content as body, derive title from filename
-    log.error(`Failed to parse frontmatter for ${filename}, using fallback`);
-    return {
-      meta: {},
-      bodyExcerpt: content,
-    };
+    // A rule glob such as `paths: **/*.ts` is not strict YAML: read the
+    // frontmatter the way the rule renders do, and keep it out of the body (#946).
+    log.debug(`Frontmatter of ${filename} is not strict YAML; read it tolerantly`);
+    data = teamRuleData(content);
+    body = teamRuleBody(content);
   }
+
+  const meta: LearningDocMeta = {
+    title: typeof data.title === 'string' ? data.title : undefined,
+    author: typeof data.author === 'string' ? data.author : undefined,
+    date: typeof data.date === 'string'
+      ? data.date
+      : data.date instanceof Date
+        ? data.date.toISOString().slice(0, 10)
+        : undefined,
+    tags: Array.isArray(data.tags)
+      ? data.tags.filter((t: unknown) => typeof t === 'string')
+      : typeof data.Tags === 'string'
+        ? data.Tags.split(/[,，]\s*/).map((t: string) => t.trim()).filter(Boolean)
+        : undefined,
+  };
+
+  return { meta, bodyExcerpt: body };
 }
 
 /**
@@ -353,16 +407,61 @@ async function aggregateVotes(votesDir: string): Promise<VoteAggregation> {
   return { scores, confidenceMap };
 }
 
+/** A file or directory a build was given and could not read. */
+export interface UnreadableFile {
+  readonly path: string;
+  /** The error code, such as `EACCES`, or the message when there is none. */
+  readonly reason: string;
+}
+
+/**
+ * What every collector of one build shares: the vote counts, the paths it
+ * could not read, and the previous index whose entries stand in for them.
+ */
+interface BuildReads {
+  readonly voteCounts: Map<string, number>;
+  readonly unreadable: UnreadableFile[];
+  /** Paths the caller could not resolve: nothing under them is read. */
+  readonly given: readonly string[];
+  readonly previous: () => Promise<readonly SearchIndexEntry[]>;
+  /** Previous entries already put back, so none is put back twice. */
+  readonly kept: Set<SearchIndexEntry>;
+}
+
+function isUnder(file: string, dir: string): boolean {
+  const rel = path.relative(dir, file);
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+/**
+ * The previous entries of `type` under `p` that a read of `p` would have
+ * selected, by their path relative to `p` (`''` for `p` itself). The collector
+ * that could not read `p` returns them where it would have returned what it
+ * read, so each keeps the selection and the precedence slot of its source (#1006).
+ */
+async function keptUnder(
+  p: string,
+  type: KnowledgeType,
+  reads: BuildReads,
+  selected: (rel: string) => boolean,
+): Promise<SearchIndexEntry[]> {
+  const out = (await reads.previous()).filter((entry) => entry.type === type && entry.path !== undefined
+    && !reads.kept.has(entry) && isUnder(entry.path, p) && selected(path.relative(p, entry.path)));
+  for (const entry of out) reads.kept.add(entry);
+  return out;
+}
+
 /**
  * Read a markdown file, truncate oversized content, and convert it to a
  * SearchIndexEntry of the given category. Used by all four collectors.
- * Returns null when the file is empty/unreadable.
+ * Returns null when the file is empty. An unreadable one is recorded in
+ * `reads`, and its previous entry, if any, is returned in its place.
  */
 async function entryFromMdFile(
   absPath: string,
   filenameForId: string,
   type: KnowledgeType,
-  voteCounts: Map<string, number>,
+  reads: BuildReads,
 ): Promise<SearchIndexEntry | null> {
   // 若当前文件是全量 codebase.md，且同目录存在 codebase-index.md，则跳过以避免重复命中。
   const basename = path.basename(absPath);
@@ -375,7 +474,16 @@ async function entryFromMdFile(
     }
   }
 
-  let content = await readFileSafe(absPath);
+  const kept = async (): Promise<SearchIndexEntry | null> =>
+    (await keptUnder(absPath, type, reads, (rel) => rel === ''))[0] ?? null;
+  if (reads.given.some((given) => isUnder(absPath, given))) return kept();
+  let content: string;
+  try {
+    content = await readFile(expandHome(absPath), 'utf-8');
+  } catch (e) {
+    reads.unreadable.push({ path: absPath, reason: failureReason(e) });
+    return kept();
+  }
   if (!content) return null;
 
   if (Buffer.byteLength(content, 'utf-8') > MAX_DOC_BYTES) {
@@ -425,25 +533,77 @@ async function entryFromMdFile(
     date: meta.date ?? '',
     tags,
     tokens: [...new Set(tokens)],
-    votes: voteCounts.get(docId) ?? 0,
+    votes: reads.voteCounts.get(docId) ?? 0,
     type,
     domain,
     path: absPath,
   };
 }
 
+/** Why an fs call failed: its error code, such as `EACCES`, or the message when there is none. */
+function failureReason(e: unknown): string {
+  return e instanceof Error ? (e as NodeJS.ErrnoException).code ?? e.message : String(e);
+}
+
+/**
+ * The entries of `dir`, none when it does not exist, or `null` when it cannot
+ * be listed for any other reason or lies under a path the caller could not
+ * resolve. The single decision of whether a directory is there: a `null` one
+ * is recorded in `reads`, whole, and its caller puts back what the previous
+ * index held under it.
+ */
+async function listDir(dir: string, reads: BuildReads): Promise<Dirent[] | null> {
+  if (reads.given.some((given) => isUnder(dir, given))) return null;
+  try {
+    return (await readdir(expandHome(dir), { withFileTypes: true })).filter((entry) => !isIgnored(entry.name));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    reads.unreadable.push({ path: dir, reason: failureReason(e) });
+    return null;
+  }
+}
+
+/**
+ * The `.md` files under `dir`, relative to it (e.g. `sub/file.md`), each
+ * directory listed by {@link listDir}, and the previous entries of `type`
+ * under a directory it could not list.
+ */
+async function listMdFilesUnder(
+  dir: string,
+  type: KnowledgeType,
+  reads: BuildReads,
+  prefix = '',
+): Promise<{ files: string[]; kept: SearchIndexEntry[] }> {
+  const current = path.join(dir, prefix);
+  const entries = await listDir(current, reads);
+  if (!entries) return { files: [], kept: await keptUnder(current, type, reads, (rel) => rel.endsWith('.md')) };
+  const out = { files: [] as string[], kept: [] as SearchIndexEntry[] };
+  for (const entry of entries) {
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isFile() && rel.endsWith('.md')) out.files.push(rel);
+    else if (entry.isDirectory()) {
+      const sub = await listMdFilesUnder(dir, type, reads, rel);
+      out.files.push(...sub.files);
+      out.kept.push(...sub.kept);
+    }
+  }
+  return out;
+}
+
 /** Collect entries from a flat *.md directory (used for `learnings`). */
 async function collectFlatMdEntries(
   dir: string,
   type: KnowledgeType,
-  voteCounts: Map<string, number>,
+  reads: BuildReads,
 ): Promise<SearchIndexEntry[]> {
-  if (!await pathExists(dir)) return [];
-  const files = await listFiles(dir);
+  const entries = await listDir(dir, reads);
+  // Only the files directly in `dir`, as a listing would select.
+  if (!entries) return keptUnder(dir, type, reads, (rel) => !rel.includes(path.sep) && rel.endsWith('.md'));
+  const files = entries.filter((entry) => entry.isFile()).map((entry) => entry.name);
   const out: SearchIndexEntry[] = [];
   for (const filename of files) {
     if (!filename.endsWith('.md')) continue;
-    const e = await entryFromMdFile(path.join(dir, filename), filename, type, voteCounts);
+    const e = await entryFromMdFile(path.join(dir, filename), filename, type, reads);
     if (e) out.push(e);
   }
   return out;
@@ -460,28 +620,49 @@ async function collectFlatMdEntries(
  * historical flat behavior for teams without a projects manifest.
  */
 async function collectLearningsEntries(
+  dirs: readonly string[],
+  namespaces: string[] | undefined,
+  reads: BuildReads,
+): Promise<SearchIndexEntry[]> {
+  // Roots are ordered by precedence. The relative path doubles as the entry id
+  // that votes are counted by, so the same path in two roots must yield ONE
+  // entry: the first root's. Deduplicating here rather than downstream is what
+  // keeps votes from being counted twice and keeps recall from silently
+  // dropping whichever copy it happened to see second (#485).
+  const out: SearchIndexEntry[] = [];
+  const claimed = new Set<string>();
+  for (const dir of dirs) {
+    for (const entry of await collectLearningsEntriesFromDir(dir, namespaces, reads)) {
+      if (claimed.has(entry.filename)) continue;
+      claimed.add(entry.filename);
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+async function collectLearningsEntriesFromDir(
   dir: string,
   namespaces: string[] | undefined,
-  voteCounts: Map<string, number>,
+  reads: BuildReads,
 ): Promise<SearchIndexEntry[]> {
-  if (!await pathExists(dir)) return [];
   // Root-level .md = always shared.
-  const out: SearchIndexEntry[] = await collectFlatMdEntries(dir, 'learnings', voteCounts);
+  const out: SearchIndexEntry[] = await collectFlatMdEntries(dir, 'learnings', reads);
 
   for (const ns of namespaces ?? []) {
     // Defense-in-depth: a namespace is a path segment (learnings/<ns>/). Skip
     // anything that isn't a safe single segment so a hand-edited config can't
-    // make the index scan outside the learnings directory. (Inlined rather than
-    // importing from ../projects.js to keep this low-level util dependency-free.)
-    if (!/^[A-Za-z0-9._-]+$/.test(ns) || ns === '.' || ns === '..') continue;
+    // make the index scan outside the learnings directory. The rule must be the
+    // one `contribute` writes with, or a learning filed under a valid non-ASCII
+    // namespace would never be indexed.
+    if (!isSafeNamespaceSegment(ns)) continue;
     const nsDir = path.join(dir, ns);
-    if (!await pathExists(nsDir)) continue;
-    const files = await listFilesRecursive(nsDir);
+    const { files, kept } = await listMdFilesUnder(nsDir, 'learnings', reads);
+    out.push(...kept);
     for (const rel of files) {
-      if (!rel.endsWith('.md')) continue;
       // Prefix the id with the namespace so it stays unique against the root and
       // other namespaces (e.g. `hai-inference/deploy-note.md`).
-      const e = await entryFromMdFile(path.join(nsDir, rel), path.join(ns, rel), 'learnings', voteCounts);
+      const e = await entryFromMdFile(path.join(nsDir, rel), path.join(ns, rel), 'learnings', reads);
       if (e) out.push(e);
     }
   }
@@ -495,16 +676,30 @@ async function collectLearningsEntries(
 async function collectRecursiveMdEntries(
   dir: string,
   type: KnowledgeType,
-  voteCounts: Map<string, number>,
+  reads: BuildReads,
 ): Promise<SearchIndexEntry[]> {
-  if (!await pathExists(dir)) return [];
-  const files = await listFilesRecursive(dir);
+  const { files, kept } = await listMdFilesUnder(dir, type, reads);
+  const out: SearchIndexEntry[] = [...kept];
+  for (const rel of files) {
+    // Use the relative path as the filename so the entry id is unique
+    // across subdirectories, e.g. `common/coding-style.md`.
+    const e = await entryFromMdFile(path.join(dir, rel), rel, type, reads);
+    if (e) out.push(e);
+  }
+  return out;
+}
+
+/** `collectRecursiveMdEntries` over an explicit list of paths relative to `dir`. */
+async function collectListedMdEntries(
+  dir: string,
+  files: readonly string[],
+  type: KnowledgeType,
+  reads: BuildReads,
+): Promise<SearchIndexEntry[]> {
   const out: SearchIndexEntry[] = [];
   for (const rel of files) {
     if (!rel.endsWith('.md')) continue;
-    // Use the relative path as the filename so the entry id is unique
-    // across subdirectories, e.g. `common/coding-style.md`.
-    const e = await entryFromMdFile(path.join(dir, rel), rel, type, voteCounts);
+    const e = await entryFromMdFile(path.join(dir, rel), rel, type, reads);
     if (e) out.push(e);
   }
   return out;
@@ -519,34 +714,73 @@ async function collectRecursiveMdEntries(
  */
 async function collectSkillEntries(
   dir: string,
-  voteCounts: Map<string, number>,
+  reads: BuildReads,
 ): Promise<SearchIndexEntry[]> {
-  if (!await pathExists(dir)) return [];
   const out: SearchIndexEntry[] = [];
 
-  async function walk(current: string): Promise<void> {
-    const subdirs = await listDirs(current);
-    for (const sub of subdirs) {
-      if (sub.startsWith('.')) continue;
-      const subPath = path.join(current, sub);
-      const skillMd = path.join(subPath, 'SKILL.md');
-      if (await pathExists(skillMd)) {
-        const e = await entryFromMdFile(skillMd, `${sub}.md`, 'skills', voteCounts);
-        if (e) out.push(e);
-      } else {
-        // Treat as a namespace directory and recurse one level.
-        await walk(subPath);
-      }
+  // A directory listing `SKILL.md`, as a file or as a link, is a skill; any
+  // other is a namespace, walked the same way.
+  async function walk(current: string, name: string | undefined): Promise<void> {
+    const entries = await listDir(current, reads);
+    if (!entries) {
+      out.push(...await keptUnder(current, 'skills', reads, (rel) => path.basename(rel) === 'SKILL.md'));
+      return;
+    }
+    if (name !== undefined && entries.some((entry) => entry.name === 'SKILL.md')) {
+      const e = await entryFromMdFile(path.join(current, 'SKILL.md'), `${name}.md`, 'skills', reads);
+      if (e) out.push(e);
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith('.')) await walk(path.join(current, entry.name), entry.name);
     }
   }
 
-  await walk(dir);
+  await walk(dir, undefined);
+  return out;
+}
+
+/**
+ * The skills to index in place of walking `skillsDir`: the directories `pull`
+ * delivers to this member (#707), or, when that set cannot be resolved this
+ * run and pull keeps the installed skills, the skills the index already holds.
+ */
+export type IndexedSkills =
+  | { readonly kind: 'dirs'; readonly dirs: readonly string[] }
+  | {
+    readonly kind: 'keep-indexed';
+    /** Why the set cannot be resolved, for a build with no index to keep them from. */
+    readonly reason: string;
+  };
+
+/**
+ * Entries for an explicit list of skill directories, each `<dir>/SKILL.md`,
+ * named after the directory (doc_id = skill name) as `collectSkillEntries` does.
+ * Pull delivers only directories with a `SKILL.md`, so a missing one is unreadable.
+ */
+async function collectSkillDirEntries(
+  dirs: readonly string[],
+  reads: BuildReads,
+): Promise<SearchIndexEntry[]> {
+  const out: SearchIndexEntry[] = [];
+  for (const dir of dirs) {
+    const skillMd = path.join(dir, 'SKILL.md');
+    const e = await entryFromMdFile(skillMd, `${path.basename(dir)}.md`, 'skills', reads);
+    if (e) out.push(e);
+  }
   return out;
 }
 
 /** Options for the multi-category build. */
 export interface BuildIndexOptions {
+  /** One learnings root. Equivalent to `learningsDirs: [dir]`. */
   learningsDir?: string;
+  /**
+   * Learnings roots, highest precedence first. For the same relative path in
+   * two roots the first one wins and the rest are skipped. Takes precedence
+   * over `learningsDir` when both are given.
+   */
+  learningsDirs?: readonly string[];
   /**
    * Active learnings namespaces (project ids). When provided, the learnings
    * collector indexes the flat root `.md` files (always shared) PLUS the `.md`
@@ -556,11 +790,35 @@ export interface BuildIndexOptions {
    */
   learningsNamespaces?: string[];
   docsDir?: string;
+  /**
+   * The docs to index, relative to `docsDir`, in place of walking all of it:
+   * the set `pull` delivers to this member (#707), so recall does not return
+   * docs of a namespace the member does not have.
+   */
+  docFiles?: readonly string[];
   rulesDir?: string;
+  /**
+   * The rules to index, relative to `rulesDir`, in place of walking all of it:
+   * the set `pull` delivers to this member (#707), so recall returns neither a
+   * root rule a namespace replaces nor a rule of an inactive namespace.
+   */
+  ruleFiles?: readonly string[];
+  /**
+   * Every skill under this directory. A member's index passes `skills`
+   * instead; `viz` indexes a whole knowledge repo, not one member's view.
+   */
   skillsDir?: string;
+  /** In place of `skillsDir`: the skills this member receives, so recall does not return others. */
+  skills?: IndexedSkills;
   codebaseDir?: string;
   votesDir?: string;
   indexPath?: string;
+  /**
+   * What the caller was given and could not resolve, such as a docs set whose
+   * manifest cannot be read: like a path the build cannot read, the previous
+   * entries under each stay.
+   */
+  unreadable?: readonly UnreadableFile[];
 }
 
 /**
@@ -583,30 +841,99 @@ export async function buildIndex(
   const opts: BuildIndexOptions = typeof optionsOrLearningsDir === 'string'
     ? { learningsDir: optionsOrLearningsDir, votesDir, indexPath }
     : optionsOrLearningsDir;
+  const index = await indexInMemory(opts);
+  const elapsed = Date.now() - start;
+
+  // A torn in-place write parses as null on the next loadIndex, which silently
+  // wipes recall until the next rebuild — same shape as the votes file (#854).
+  const target = opts.indexPath ?? getSearchIndexPath();
+  try {
+    await writeJsonAtomic(target, index);
+  } catch (e) {
+    // The previous index would keep serving what the member no longer receives (#1006).
+    if (await rm(target, { force: true }).then(() => true, () => false)) {
+      log.warn(`Search index could not be written to ${target} (${failureReason(e)}); the previous one was removed. `
+        + 'Fix the cause and run `teamai pull` to build it again.');
+    } else {
+      log.warn(`Search index could not be written to ${target} (${failureReason(e)}), and the previous one could not be removed. `
+        + 'Recall may return what you no longer receive until you fix the cause and run `teamai pull`.');
+    }
+    throw e;
+  }
+
+  if (elapsed > 2000) {
+    log.warn(`Search index build took ${elapsed}ms — consider incremental updates for large knowledge bases`);
+  }
+
+  return elapsed;
+}
+
+/** Name the files and directories a build could not read, which keep their entries from the previous index. */
+function warnUnreadable(unreadable: readonly UnreadableFile[]): void {
+  const shown = unreadable.slice(0, 3).map((file) => `${file.path}: ${file.reason}`).join(', ');
+  const files = unreadable.length > 3 ? `${shown}, and ${unreadable.length - 3} more` : shown;
+  log.warn(`Search index could not read ${unreadable.length} path(s) (${files}); recall keeps what the previous index held for them. `
+    + 'Fix them and run `teamai pull` to index them again.');
+}
+
+/**
+ * The index {@link buildIndex} would write, built in memory and not saved: for
+ * a dry run, which must search what a real run would without writing it.
+ */
+export async function indexInMemory(opts: BuildIndexOptions): Promise<SearchIndex> {
+  const start = Date.now();
 
   // Aggregate votes once and reuse across all collectors.
-  const voteAgg = opts.votesDir
-    ? await aggregateVotes(opts.votesDir)
-    : { scores: new Map<string, number>(), confidenceMap: new Map<string, number>() };
-  const voteCounts = voteAgg.scores;
+  let voteAgg: VoteAggregation = { scores: new Map<string, number>(), confidenceMap: new Map<string, number>() };
+  if (opts.votesDir) {
+    try {
+      voteAgg = await aggregateVotes(opts.votesDir);
+    } catch (e) {
+      log.warn(`Search index could not read the votes in ${opts.votesDir} (${failureReason(e)}); it ranks without them until the next rebuild.`);
+    }
+  }
+  let previous: SearchIndex | null | undefined;
+  const previousEntries = async (): Promise<SearchIndexEntry[]> => {
+    if (previous === undefined) previous = await loadIndex(opts.indexPath ?? getSearchIndexPath());
+    return previous?.entries ?? [];
+  };
+  const reads: BuildReads = {
+    voteCounts: voteAgg.scores,
+    unreadable: [...opts.unreadable ?? []],
+    given: (opts.unreadable ?? []).map((unreadable) => unreadable.path),
+    previous: previousEntries,
+    kept: new Set(),
+  };
 
   const entries: SearchIndexEntry[] = [];
 
-  if (opts.learningsDir) {
-    entries.push(...await collectLearningsEntries(opts.learningsDir, opts.learningsNamespaces, voteCounts));
+  const learningsDirs = opts.learningsDirs ?? (opts.learningsDir ? [opts.learningsDir] : []);
+  if (learningsDirs.length > 0) {
+    entries.push(...await collectLearningsEntries(learningsDirs, opts.learningsNamespaces, reads));
   }
-  if (opts.docsDir) {
-    entries.push(...await collectRecursiveMdEntries(opts.docsDir, 'docs', voteCounts));
+  if (opts.docsDir && opts.docFiles) {
+    entries.push(...await collectListedMdEntries(opts.docsDir, opts.docFiles, 'docs', reads));
+  } else if (opts.docsDir) {
+    entries.push(...await collectRecursiveMdEntries(opts.docsDir, 'docs', reads));
   }
-  if (opts.rulesDir) {
-    entries.push(...await collectRecursiveMdEntries(opts.rulesDir, 'rules', voteCounts));
+  if (opts.rulesDir && opts.ruleFiles) {
+    entries.push(...await collectListedMdEntries(opts.rulesDir, opts.ruleFiles, 'rules', reads));
+  } else if (opts.rulesDir) {
+    entries.push(...await collectRecursiveMdEntries(opts.rulesDir, 'rules', reads));
   }
-  if (opts.skillsDir) {
-    entries.push(...await collectSkillEntries(opts.skillsDir, voteCounts));
+  if (opts.skills?.kind === 'dirs') {
+    entries.push(...await collectSkillDirEntries(opts.skills.dirs, reads));
+  } else if (opts.skills?.kind === 'keep-indexed') {
+    entries.push(...(await previousEntries()).filter((entry) => entry.type === 'skills'));
+  } else if (opts.skillsDir) {
+    entries.push(...await collectSkillEntries(opts.skillsDir, reads));
   }
   if (opts.codebaseDir) {
-    entries.push(...await collectRecursiveMdEntries(opts.codebaseDir, 'docs', voteCounts));
+    entries.push(...await collectRecursiveMdEntries(opts.codebaseDir, 'docs', reads));
   }
+  // The index follows what the member receives (#1006): of the previous index,
+  // only the entries the collectors put back for what they could not read stay.
+  if (reads.unreadable.length > 0) warnUnreadable(reads.unreadable);
 
   // Annotate entries with confidence/hotness for hot/cold scoring.
   if (voteAgg.confidenceMap.size > 0) {
@@ -621,49 +948,38 @@ export async function buildIndex(
   // Build document-frequency map for IDF weighting.
   // Count how many *entries* contain each token (not raw term frequency).
   const df: Record<string, number> = {};
+  const dfByDomain: NonNullable<SearchIndex['dfByDomain']> = {};
   for (const entry of entries) {
+    const domain = entry.domain ?? 'neutral';
+    const domainDf = dfByDomain[domain] ??= {};
     for (const token of new Set(entry.tokens)) {
       df[token] = (df[token] ?? 0) + 1;
+      domainDf[token] = (domainDf[token] ?? 0) + 1;
     }
   }
 
-  const elapsed = Date.now() - start;
-
-  // Guard: don't overwrite a healthy index with a significantly smaller one
-  const targetPath = opts.indexPath ?? getSearchIndexPath();
-  const existingIndex = await loadIndex(targetPath);
-  if (existingIndex && existingIndex.entries.length > 5 && entries.length < existingIndex.entries.length * 0.2) {
-    log.warn(`Index rebuild skipped: new index (${entries.length}) is <20% of existing (${existingIndex.entries.length}), likely partial failure`);
-    return elapsed;
-  }
-
-  const index: SearchIndex = {
+  return {
     version: SEARCH_INDEX_VERSION,
     builtAt: new Date().toISOString(),
-    elapsedMs: elapsed,
+    elapsedMs: Date.now() - start,
     entries,
     df,
+    dfByDomain,
   };
-
-  await writeJson(targetPath, index);
-
-  if (elapsed > 2000) {
-    log.warn(`Search index build took ${elapsed}ms — consider incremental updates for large knowledge bases`);
-  }
-
-  return elapsed;
 }
 
 /**
- * Returns true when the on-disk index pre-dates the current schema version.
- * Covers both pre-Phase-1 (no version/type) and pre-Phase-1.4 (no domain) indexes.
+ * Returns true when the on-disk index predates the current schema version or
+ * lacks the per-domain IDF statistics added in v7.
  * The caller should rebuild such an index using the multi-category collectors.
  */
 export function isLegacyIndex(index: SearchIndex | null): boolean {
   if (!index) return false;
   if (typeof index.version !== 'number' || index.version < SEARCH_INDEX_VERSION) return true;
-  // Any entry missing type or domain → legacy; domain was added in v3.
-  return index.entries.some((e) => !e.type || e.domain === undefined) || !index.df;
+  return index.entries.some((e) => !e.type || e.domain === undefined)
+    || !index.df
+    || !index.dfByDomain
+    || index.entries.some((e) => index.dfByDomain?.[e.domain ?? 'neutral'] === undefined);
 }
 
 /**
@@ -741,20 +1057,30 @@ export function search(
   const queryDomain = inferQueryDomain(queryTokens);
   const domainWeightRow = DOMAIN_WEIGHT[queryDomain];
 
-  // IDF helpers (改动 B).
-  // N = total number of indexed entries; df = per-token document frequency.
-  // Falls back gracefully when df is absent (legacy index built before v4).
-  const N = index.entries.length;
+  // IDF uses each entry's domain so adding unrelated knowledge cannot change
+  // the score of an existing entry. Older in-memory indexes keep their global
+  // df behavior until the caller rebuilds the persisted index.
+  const domainSizes: Partial<Record<KnowledgeDomain, number>> = {};
+  for (const entry of index.entries) {
+    const domain = entry.domain ?? 'neutral';
+    domainSizes[domain] = (domainSizes[domain] ?? 0) + 1;
+  }
   const df = index.df ?? {};
 
   /**
-   * IDF score for a token: log((N + 1) / (docFreq + 1)).
-   * Returns 1.0 when df map is unavailable (no-op for legacy indexes).
+   * IDF score for a token within its entry's domain. Falls back to the global
+   * v6 map for older indexes and to 1.0 when no df map is available.
    */
-  const idf = (token: string): number => {
+  const idf = (token: string, domain: KnowledgeDomain): number => {
+    const domainDf = index.dfByDomain?.[domain];
+    if (domainDf) {
+      const n = domainSizes[domain] ?? 0;
+      const docFreq = domainDf[token] ?? 0;
+      return Math.log((n + 1) / (docFreq + 1)) + 1;
+    }
     if (!index.df) return 1.0;
     const docFreq = df[token] ?? 0;
-    return Math.log((N + 1) / (docFreq + 1)) + 1; // +1 smoothing keeps score ≥ 1
+    return Math.log((index.entries.length + 1) / (docFreq + 1)) + 1;
   };
 
   // Query-length normalization: raw match sums grow with query length, so a
@@ -779,6 +1105,7 @@ export function search(
   for (const entry of index.entries) {
     let score = 0;
     let hasTitleOrTagMatch = false;
+    const entryDomain = entry.domain ?? 'neutral';
     const entryTokens = new Set(entry.tokens);
 
     for (const qt of queryTokens) {
@@ -786,15 +1113,15 @@ export function search(
       const tagToken = `tag:${qt}`;
 
       if (entryTokens.has(titleToken)) {
-        score += 3 * idf(titleToken);
+        score += 3 * idf(titleToken, entryDomain);
         hasTitleOrTagMatch = true;
       }
       if (entryTokens.has(tagToken)) {
-        score += 2 * idf(tagToken);
+        score += 2 * idf(tagToken, entryDomain);
         hasTitleOrTagMatch = true;
       }
       if (entryTokens.has(qt)) {
-        score += 1 * idf(qt);
+        score += 1 * idf(qt, entryDomain);
       }
     }
 

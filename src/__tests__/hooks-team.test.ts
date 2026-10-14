@@ -4,6 +4,8 @@ let mockFiles: Record<string, unknown> = {};
 
 vi.mock('../utils/fs.js', () => ({
   readJson: vi.fn(async (filePath: string) => mockFiles[filePath] ?? null),
+  readJsonObject: vi.fn(async (filePath: string) => (filePath in mockFiles
+    ? { kind: 'ok', value: mockFiles[filePath] } : { kind: 'missing' })),
   writeJson: vi.fn(async (filePath: string, data: unknown) => {
     mockFiles[filePath] = JSON.parse(JSON.stringify(data));
   }),
@@ -15,7 +17,7 @@ vi.mock('../utils/logger.js', () => ({
   log: { info: vi.fn(), success: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { reconcileHooks } from '../hooks.js';
+import { claudeHookOtherHostSkip, reconcileHooks } from '../hooks.js';
 import type { HookDef } from '../types.js';
 
 const SETTINGS = '/test/settings.json';
@@ -60,7 +62,7 @@ describe('reconcileHooks — team (B) hooks', () => {
       const team = postToolUse[postToolUse.length - 1];
       expect(team.description).toBe('[teamai:hook:block-secret] scan secrets before bash');
       expect(team.matcher).toBe('Bash');
-      expect(team.hooks[0].command).toContain('scan.sh');
+      expect(team.hooks[0].command).toBe(`${claudeHookOtherHostSkip('PostToolUse', 'Bash', teamDef().command)}${teamDef().command}`);
     });
 
     it('records the team hook in the manifest', async () => {
@@ -85,7 +87,7 @@ describe('reconcileHooks — team (B) hooks', () => {
       await reconcileHooks(SETTINGS, 'claude', [teamDef({ command: 'echo changed' })], { manifestPath: MANIFEST });
 
       const team = claudeHooks().PostToolUse.find((h) => h.description?.startsWith('[teamai:hook:block-secret]'));
-      expect(team?.hooks[0].command).toBe('echo changed');
+      expect(team?.hooks[0].command).toBe(`${claudeHookOtherHostSkip('PostToolUse', 'Bash', 'echo changed')}echo changed`);
       expect(claudeHooks().PostToolUse).toHaveLength(4);
     });
 
@@ -117,6 +119,7 @@ describe('reconcileHooks — team (B) hooks', () => {
 
       expect(cursorHooks().postToolUse).toHaveLength(4);
       const team = cursorHooks().postToolUse.find((h) => h.command.includes('scan.sh'));
+      expect(team?.command).toBe(teamDef().command);
       expect(team).toMatchObject({ matcher: 'Bash', timeout: 15 });
       expect(manifest().cursor?.[0].id).toBe('block-secret');
     });

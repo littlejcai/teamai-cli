@@ -1,10 +1,11 @@
 import { createRequire } from "node:module";
+import { setFlagsFromString } from "node:v8";
 
 import { Language, Parser, Query } from "web-tree-sitter";
 
-import { GO_AST_QUERY_SOURCE, PYTHON_AST_QUERY_SOURCE, TS_AST_QUERY_SOURCE } from "./queries.js";
+import { GO_AST_QUERY_SOURCE, PYTHON_AST_QUERY_SOURCE, SWIFT_AST_QUERY_SOURCE, TS_AST_QUERY_SOURCE } from "./queries.js";
 
-export type GrammarVariant = "typescript" | "tsx" | "python" | "go";
+export type GrammarVariant = "typescript" | "tsx" | "python" | "go" | "swift";
 
 const require = createRequire(import.meta.url);
 
@@ -12,14 +13,16 @@ const GRAMMAR_WASM: Record<GrammarVariant, string> = {
   typescript: "tree-sitter-wasms/out/tree-sitter-typescript.wasm",
   tsx: "tree-sitter-wasms/out/tree-sitter-tsx.wasm",
   python: "tree-sitter-wasms/out/tree-sitter-python.wasm",
-  go: "tree-sitter-wasms/out/tree-sitter-go.wasm"
+  go: "tree-sitter-wasms/out/tree-sitter-go.wasm",
+  swift: "tree-sitter-wasms/out/tree-sitter-swift.wasm"
 };
 
 const QUERY_SOURCE: Record<GrammarVariant, string> = {
   typescript: TS_AST_QUERY_SOURCE,
   tsx: TS_AST_QUERY_SOURCE,
   python: PYTHON_AST_QUERY_SOURCE,
-  go: GO_AST_QUERY_SOURCE
+  go: GO_AST_QUERY_SOURCE,
+  swift: SWIFT_AST_QUERY_SOURCE
 };
 
 let parserInstance: Parser | undefined;
@@ -40,7 +43,28 @@ export async function ensureAstReady(): Promise<void> {
   return initPromise;
 }
 
+const NO_WASM_FUNCTION_INDEX = 2 ** 31 - 1;
+
+/**
+ * On Node 24+, keep tree-sitter grammars on V8's baseline Wasm tier.
+ *
+ * V8's optimizing Wasm compiler there exhausts its Zone memory on grammar code
+ * and aborts the process with "Fatal process out of memory: Zone"
+ * (nodejs/node#63421); the Swift grammar hits it right after its first parse.
+ * The filter allows tier-up only for a function index no grammar has.
+ * --liftoff-only does the same, but Node 24 ignores it when set at runtime.
+ * The flag is process-wide, so any other Wasm (such as undici's HTTP parser)
+ * stays on the baseline tier too. Older runtimes keep tier-up, which parses
+ * about 1.6x faster.
+ */
+function keepWasmOnBaselineTier(): void {
+  if (Number(process.versions.node.split(".")[0]) >= 24) {
+    setFlagsFromString(`--wasm-tier-up-filter=${NO_WASM_FUNCTION_INDEX}`);
+  }
+}
+
 async function initAst(): Promise<void> {
+  keepWasmOnBaselineTier();
   await Parser.init({
     locateFile: () => require.resolve("web-tree-sitter/tree-sitter.wasm")
   });
@@ -77,6 +101,8 @@ export function grammarForExtension(ext: string): GrammarVariant | undefined {
       return "python";
     case ".go":
       return "go";
+    case ".swift":
+      return "swift";
     default:
       return undefined;
   }

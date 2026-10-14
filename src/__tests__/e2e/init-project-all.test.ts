@@ -82,12 +82,12 @@ function installGitRemoteGetUrlWrapper(binDir: string, syntheticOrigin: string):
 if [ "$1" = "remote" ] && [ "$2" = "get-url" ]; then
   case "$3" in
     ""|origin|--all)
-      printf '%s\\n' '${syntheticOrigin.replace(/'/g, `'\"'\"'`)}'
+      printf '%s\\n' '${syntheticOrigin.replace(/'/g, `'"'"'`)}'
       exit 0
       ;;
   esac
 fi
-exec '${realGit.replace(/'/g, `'\"'\"'`)}' "$@"
+exec '${realGit.replace(/'/g, `'"'"'`)}' "$@"
 `,
     { mode: 0o755 },
   );
@@ -256,8 +256,8 @@ describe("init --project all activates every project in the manifest (issue #509
     // Project scope stores the clone under the project dataHome, not ~/.teamai.
     // realpathSync both sides: macOS aliases /var to /private/var, which
     // path.resolve() alone does not reconcile.
-    expect(fs.realpathSync(teamRepo)).toBe(
-      fs.realpathSync(path.join(projectRoot, '.teamai', 'team-repo')),
+    expect(fs.realpathSync.native(teamRepo)).toBe(
+      fs.realpathSync.native(path.join(projectRoot, '.teamai', 'team-repo')),
     );
 
     // Point push at the bare remote so pull can see upcoming updates without a
@@ -354,4 +354,30 @@ describe("init --project all activates every project in the manifest (issue #509
       expect(second.output).toMatch(/Failed to refresh existing clone|fast-forward|ff-only|not possible|diverg/i);
     }
   }, 90_000);
+
+  it('skips the optional project picker without a terminal and keeps no project active', async () => {
+    const unattendedRoot = path.join(sandbox, 'unattended-project');
+    const unattendedHome = path.join(sandbox, 'unattended-home');
+    fs.mkdirSync(unattendedRoot, { recursive: true });
+    fs.mkdirSync(unattendedHome, { recursive: true });
+    fs.copyFileSync(path.join(home, '.gitconfig'), path.join(unattendedHome, '.gitconfig'));
+
+    const result = await runCLI(
+      ['init', FAKE_URL, '--scope', 'project', '--role', 'common', '--force'],
+      unattendedRoot,
+      unattendedHome,
+      { ...cliEnv, TEAMAI_NONINTERACTIVE: '1' },
+    );
+
+    expect(result.code, result.output).toBe(0);
+    expect(readProjects(unattendedRoot)).toEqual([]);
+    const manifestPath = path.join(readClonePath(unattendedRoot), 'manifest', 'projects.yaml');
+    const projectIds = (YAML.parse(fs.readFileSync(manifestPath, 'utf8')) as {
+      projects: Array<{ id: string }>;
+    }).projects.map((project) => project.id);
+    expect(result.output).toContain(
+      `This team repo declares projects: ${projectIds.join(', ')}. Run ` +
+        '`teamai projects set <id>` to activate one.',
+    );
+  }, 60_000);
 });

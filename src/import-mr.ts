@@ -9,15 +9,12 @@ import { fetchGitLabMR } from './providers/gitlab/mr-fetch.js';
 import { fetchTGitMR } from './providers/tgit/mr-fetch.js';
 import type { MRData, LearningDraft } from './types.js';
 import { callClaude } from './utils/ai-client.js';
-import { extractKeywords, findSupersededLearnings } from './utils/dedup.js';
+import { extractKeywords, findOverlappingLearnings } from './utils/dedup.js';
 import { log, spinner } from './utils/logger.js';
 import { getUserHome } from './utils/home.js';
 
 /** Default directory for storing learnings. */
 const DEFAULT_LEARNINGS_DIR = path.join(getUserHome(), '.teamai', 'learnings');
-
-/** Dedup similarity threshold. */
-const SUPERSEDE_THRESHOLD = 0.6;
 
 /**
  * Auto-detects the provider from the URL and fetches MR data.
@@ -172,22 +169,26 @@ function extractRepoUrlFromMrUrl(mrUrl: string): string {
  * Implements P0.5: fetch MR data → AI extraction → dedup → interactive confirm → write file.
  *
  * @param opts.url          Full MR / PR URL (required)
- * @param opts.learningsDir Directory for dedup scanning, default ~/.teamai/learnings
+ * @param opts.learningsDirs Learnings roots compared with the draft for a possible duplicate
+ * @param opts.learningsNamespaces The active project namespaces compared under each root
  * @param opts.all          Skip interactive confirmation, accept all
  * @param opts.outputDir    Output mode: write to this directory (learning.md)
- * @param opts.repoPath     Team repo path (written to learnings/ when outputDir is not set)
+ * @param opts.queueLearning  Queues a new learning (its file name, its content) when outputDir is not set, returning the file written
  * @param opts.dryRun       Dry run, no disk writes
  * @returns                 Extraction result containing the learning draft and inferred repo URL
  */
 export async function importFromMR(opts: {
   url: string;
-  learningsDir?: string;
+  /** Learnings roots compared with the draft, highest precedence first. */
+  learningsDirs?: readonly string[];
+  /** The active project namespaces: recall finds their learnings here, and no others. */
+  learningsNamespaces?: readonly string[];
   all?: boolean;
   outputDir?: string;
-  repoPath?: string;
+  queueLearning?: (filename: string, content: string) => Promise<string>;
   dryRun?: boolean;
-}): Promise<{ learning?: LearningDraft; repoUrl: string }> {
-  const learningsDir = opts.learningsDir ?? DEFAULT_LEARNINGS_DIR;
+}): Promise<{ learning?: LearningDraft; repoUrl: string; learningFile?: string }> {
+  const learningsDirs = opts.learningsDirs ?? [DEFAULT_LEARNINGS_DIR];
 
   // ── 步骤 1：获取 MR 数据 ────────────────────────────────
   const fetchSpinner = spinner('Fetching MR data...');
@@ -221,15 +222,12 @@ export async function importFromMR(opts: {
   const learningTitle = (frontmatter['title'] as string | undefined) ?? mr.title;
 
   const draftKeywords = extractKeywords(learningContent);
-  const supersededEntries = await findSupersededLearnings(draftKeywords, learningsDir);
-  const supersedes = supersededEntries
-    .filter((entry) => entry.overlap >= SUPERSEDE_THRESHOLD)
+  const possibleDuplicates = (await findOverlappingLearnings(draftKeywords, learningsDirs, { namespaces: opts.learningsNamespaces }))
     .map((entry) => entry.filename);
 
   const learning: LearningDraft = {
     title: learningTitle,
     content: learningContent,
-    supersedes: supersedes.length > 0 ? supersedes : undefined,
   };
 
   // ── 步骤 4：打印摘要 ────────────────────────────────────
@@ -240,8 +238,9 @@ export async function importFromMR(opts: {
     log.info(`   Tags: ${tags.join(', ')}`);
   }
 
-  if (supersedes.length > 0) {
-    log.warn(`⚠️  Found ${supersedes.length} overlapping session learnings, marking as superseded`);
+  if (possibleDuplicates.length > 0) {
+    // Names the existing learnings; accepting the draft changes none of them.
+    log.warn(`Possible duplicate: this learning overlaps ${possibleDuplicates.length} existing learning(s): ${possibleDuplicates.join(', ')}.`);
   }
 
   // ── 步骤 5：交互确认 ───────────────────────────────────
@@ -252,8 +251,9 @@ export async function importFromMR(opts: {
   }
 
   // ── 步骤 6：写文件 ─────────────────────────────────────
+  let learningFile: string | undefined;
   if (!opts.dryRun && acceptLearning) {
-    await writeLearning(learning, opts.outputDir, opts.repoPath);
+    learningFile = await writeLearning(learning, opts.outputDir, opts.queueLearning);
   }
 
   // 推断仓库 URL
@@ -262,47 +262,42 @@ export async function importFromMR(opts: {
   return {
     learning: acceptLearning ? learning : undefined,
     repoUrl,
+    learningFile,
   };
 }
 
 /**
  * 将 learning 草稿写入磁盘。
  *
- * outputDir 优先；否则尝试写到 repoPath/learnings/；两者均未设则打印警告跳过。
+ * Writes to outputDir when given, else into the queue, and returns the file written.
+ * With neither, it warns and skips.
  *
- * @param draft      LearningDraft 对象
- * @param outputDir  输出目录（可选）
- * @param repoPath   团队 repo 根路径（可选）
+ * @param draft         The learning draft
+ * @param outputDir     Output directory (optional)
+ * @param learningsDir  Where new learnings are written (the write root, optional)
  */
 async function writeLearning(
   draft: LearningDraft,
   outputDir?: string,
-  repoPath?: string,
-): Promise<void> {
+  queueLearning?: (filename: string, content: string) => Promise<string>,
+): Promise<string | undefined> {
   if (outputDir) {
     await fs.mkdir(outputDir, { recursive: true });
     const filePath = path.join(outputDir, 'learning.md');
     await fs.writeFile(filePath, draft.content, 'utf-8');
     log.info(`Learning written: ${filePath}`);
-    return;
+    return filePath;
   }
 
-  if (repoPath) {
-    const learningsDir = path.join(repoPath, 'learnings');
-    await fs.mkdir(learningsDir, { recursive: true });
-    const datePrefix = new Date().toISOString().slice(0, 10);
-    // 将标题转为合法文件名：取前 40 字符，替换非法字符为连字符
-    const safeTitle = draft.title
-      .slice(0, 40)
-      .replace(/[^a-zA-Z0-9一-鿿_-]/g, '-')
-      .replace(/-+/g, '-')
-      .replace(/^-|-$/g, '');
-    const filename = `${datePrefix}-${safeTitle}.md`;
-    const filePath = path.join(learningsDir, filename);
-    await fs.writeFile(filePath, draft.content, 'utf-8');
+  if (queueLearning) {
+    // contribute's naming: the random suffix keeps two members' learnings with
+    // the same title and day apart once both are published (#823).
+    const { generateFilename } = await import('./contribute.js');
+    const filePath = await queueLearning(generateFilename(draft.title), draft.content);
     log.info(`Learning written: ${filePath}`);
-    return;
+    return filePath;
   }
 
-  log.warn('No outputDir or repoPath specified, learning draft not saved to disk');
+  log.warn('No outputDir or learnings directory specified, learning draft not saved to disk');
+  return undefined;
 }

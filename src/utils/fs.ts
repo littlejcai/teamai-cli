@@ -2,7 +2,7 @@ import fse from 'fs-extra';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { log } from './logger.js';
-import { getUserHome } from './home.js';
+import { expandHome } from './home.js';
 
 const IGNORED_NAMES = new Set([
   '__pycache__',
@@ -12,19 +12,11 @@ const IGNORED_NAMES = new Set([
   '.git',
 ]);
 
-function isIgnored(name: string): boolean {
+export function isIgnored(name: string): boolean {
   return IGNORED_NAMES.has(name) || name.endsWith('.pyc');
 }
 
-/**
- * Expand ~ to the platform user home directory in paths.
- */
-export function expandHome(p: string): string {
-  if (p.startsWith('~/') || p === '~') {
-    return path.join(getUserHome(), p.slice(1));
-  }
-  return p;
-}
+export { expandHome } from './home.js';
 
 /**
  * Ensure a directory exists
@@ -45,12 +37,50 @@ export async function readFileSafe(filePath: string): Promise<string | null> {
 }
 
 /**
- * Write a file, creating parent dirs as needed.
+ * Read a file that is allowed to be absent. `null` means the file does not
+ * exist; any other failure (permissions, I/O) is thrown, unlike `readFileSafe`,
+ * which folds every error into `null`. Use this where a caller must tell
+ * "the team has no such file" apart from "the file could not be read".
  */
-export async function writeFile(filePath: string, content: string): Promise<void> {
+export async function readFileIfExists(filePath: string): Promise<string | null> {
+  try {
+    return await fse.readFile(expandHome(filePath), 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+/**
+ * Write a file, creating parent dirs as needed. Bytes are written as they are.
+ */
+export async function writeFile(filePath: string, content: string | Uint8Array): Promise<void> {
   const expanded = expandHome(filePath);
   await fse.ensureDir(path.dirname(expanded));
   await fse.writeFile(expanded, content, 'utf-8');
+}
+
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * The path a link chain starting at `filePath` ends at, whether or not a file
+ * exists there yet; `filePath` itself when it is not a link. Each hop resolves
+ * against the real directory of the link, as the kernel does.
+ */
+export async function symlinkTarget(filePath: string): Promise<string> {
+  let target = filePath;
+  for (let hops = 0; hops < MAX_SYMLINK_HOPS; hops++) {
+    try {
+      if (!(await fse.lstat(target)).isSymbolicLink()) return target;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return target;
+      throw error;
+    }
+    target = path.resolve(await fse.realpath(path.dirname(target)), await fse.readlink(target));
+  }
+  throw new Error(
+    `Cannot write ${filePath}: it is part of a symbolic link loop. Point the link at a regular file, then retry.`,
+  );
 }
 
 /**
@@ -63,20 +93,29 @@ export async function writeFile(filePath: string, content: string): Promise<void
  * replaces it in one step, and on any error the temp file is removed and the
  * original left in place. Use this for a single-copy, must-not-be-lost file
  * such as a partition's config.yaml; `writeFile` (a plain overwrite) is fine
- * for regenerable files.
+ * for regenerable files. Pass options.mode to force restrictive permissions
+ * for a file that newly contains credentials.
+ *
+ * A symlinked target is written at the file its link chain ends at, so the
+ * links stay; for a dangling link that file (and its directory) is created.
  */
-export async function writeFileAtomic(filePath: string, content: string): Promise<void> {
-  const expanded = expandHome(filePath);
+export async function writeFileAtomic(
+  filePath: string,
+  content: string,
+  options?: { mode?: number },
+): Promise<void> {
+  const expanded = await symlinkTarget(expandHome(filePath));
   await fse.ensureDir(path.dirname(expanded));
-  let mode = 0o600;
+  let mode = options?.mode ?? 0o600;
   try {
-    mode = (await fse.stat(expanded)).mode & 0o777;
+    if (options?.mode === undefined) mode = (await fse.stat(expanded)).mode & 0o777;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
   }
   const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
-    await fse.writeFile(tmp, content, 'utf-8');
+    // Created with the mode, so it is never readable wider than the target; chmod undoes the umask.
+    await fse.writeFile(tmp, content, { encoding: 'utf-8', mode, flag: 'wx' });
     await fse.chmod(tmp, mode);
     await fse.rename(tmp, expanded);
   } catch (error) {
@@ -96,6 +135,26 @@ export async function readJson<T = unknown>(filePath: string): Promise<T | null>
   } catch {
     log.warn(`Failed to parse JSON: ${filePath}`);
     return null;
+  }
+}
+
+/** A JSON file read as an object: missing, not a JSON object (and why), or its value. */
+export type JsonObjectRead =
+  | { kind: 'missing' }
+  | { kind: 'invalid'; error: string }
+  | { kind: 'ok'; value: Record<string, unknown> };
+
+/** Read a file that should hold a JSON object, saying why when it does not. Never throws, never logs. */
+export async function readJsonObject(filePath: string): Promise<JsonObjectRead> {
+  const raw = await readFileSafe(filePath);
+  if (raw === null) return { kind: 'missing' };
+  try {
+    const value: unknown = JSON.parse(raw);
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? { kind: 'ok', value: value as Record<string, unknown> }
+      : { kind: 'invalid', error: 'not a JSON object' };
+  } catch (e) {
+    return { kind: 'invalid', error: (e as Error).message };
   }
 }
 
@@ -138,7 +197,8 @@ export async function writeJsonAtomic(
   }
   const tmp = `${expanded}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
   try {
-    await fse.writeFile(tmp, content, 'utf-8');
+    // Created with the mode, so it is never readable wider than the target; chmod undoes the umask.
+    await fse.writeFile(tmp, content, { encoding: 'utf-8', mode, flag: 'wx' });
     await fse.chmod(tmp, mode);
     await fse.rename(tmp, expanded);
   } catch (error) {
@@ -151,8 +211,12 @@ export async function writeJsonAtomic(
  * Copy a directory recursively.
  * If `dest` is a symlink (e.g. left over from setup-links.sh), remove it first
  * so fse.copy can create a real directory in its place.
+ * With `onLink`, a link in `src` is not copied (nor followed): `onLink` gets its
+ * path relative to `src`. Without it, links are copied as links.
  */
-export async function copyDir(src: string, dest: string): Promise<void> {
+export async function copyDir(
+  src: string, dest: string, onLink?: (relativePath: string) => void, skip: readonly string[] = [],
+): Promise<void> {
   const destExpanded = expandHome(dest);
   try {
     const stat = await fse.lstat(destExpanded);
@@ -162,9 +226,18 @@ export async function copyDir(src: string, dest: string): Promise<void> {
   } catch {
     // dest doesn't exist yet — that's fine
   }
-  await fse.copy(expandHome(src), destExpanded, {
+  const srcExpanded = expandHome(src);
+  await fse.copy(srcExpanded, destExpanded, {
     overwrite: true,
-    filter: (srcPath: string) => !isIgnored(path.basename(srcPath)),
+    filter: async (srcPath: string) => {
+      if (isIgnored(path.basename(srcPath))) return false;
+      // An entry `skip` names, and everything under it, is left as the destination has it.
+      const rel = path.relative(srcExpanded, srcPath).split(path.sep).join('/');
+      if (skip.some((entry) => rel === entry || rel.startsWith(`${entry}/`))) return false;
+      if (onLink === undefined || srcPath === srcExpanded || !(await fse.lstat(srcPath)).isSymbolicLink()) return true;
+      onLink(path.relative(srcExpanded, srcPath).split(path.sep).join('/'));
+      return false;
+    },
   });
 }
 
@@ -298,6 +371,20 @@ export async function pathExists(p: string): Promise<boolean> {
 }
 
 /**
+ * Who wrote a file teamai generates into another tool's directory: nobody yet,
+ * teamai (its content carries `marker`), or someone else. teamai writes and
+ * removes only `absent` and `teamai` files, so a same-named file of the
+ * user's is never overwritten or deleted.
+ */
+export type GeneratedFileState = 'absent' | 'teamai' | 'foreign';
+
+export async function generatedFileState(file: string, marker: string): Promise<GeneratedFileState> {
+  const content = await readFileSafe(file);
+  if (content === null) return await pathExists(file) ? 'foreign' : 'absent';
+  return content.includes(marker) ? 'teamai' : 'foreign';
+}
+
+/**
  * Remove a file or directory
  */
 export async function remove(p: string): Promise<void> {
@@ -344,7 +431,7 @@ export async function getDirLatestMtime(dirPath: string): Promise<number> {
 /**
  * Compute SHA-256 hash of a file's contents. Returns null if file does not exist.
  */
-async function fileHash(filePath: string): Promise<string | null> {
+export async function fileHash(filePath: string): Promise<string | null> {
   try {
     const content = await fse.readFile(filePath);
     return crypto.createHash('sha256').update(content).digest('hex');

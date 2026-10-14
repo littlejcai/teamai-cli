@@ -56,6 +56,30 @@ describe('MemberConfigSchema', () => {
   });
 });
 
+describe('LocalConfigSchema', () => {
+  it("expands a home-relative repo.localPath so git and the manifest readers see an absolute path", () => {
+    const previousHome = process.env.HOME;
+    process.env.HOME = '/home/e2e';
+    try {
+      const parsed = LocalConfigSchema.parse({
+        repo: { localPath: '~/.teamai/team-repo', remote: 'https://github.com/acme/team.git' },
+        username: 'e2e',
+      });
+      expect(parsed.repo.localPath).toBe('/home/e2e/.teamai/team-repo');
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
+    }
+  });
+
+  it('leaves an absolute repo.localPath untouched', () => {
+    const parsed = LocalConfigSchema.parse({
+      repo: { localPath: '/srv/team-repo', remote: 'https://github.com/acme/team.git' },
+      username: 'e2e',
+    });
+    expect(parsed.repo.localPath).toBe('/srv/team-repo');
+  });
+});
+
 describe('TeamaiConfigSchema', () => {
   it.each(['github', 'tgit', 'cnb', 'git'] as const)(
     'accepts the %s provider',
@@ -104,7 +128,6 @@ describe('TeamaiConfigSchema', () => {
     expect(result.toolPaths).toHaveProperty('openclaw');
     expect(result.toolPaths.openclaw).toEqual({
       skills: '.openclaw/skills',
-      rules: '.openclaw/rules',
       claudemd: '.openclaw/workspace/AGENTS.md',
     });
   });
@@ -115,11 +138,12 @@ describe('TeamaiConfigSchema', () => {
       repo: 'https://git.woa.com/test/repo.git',
     });
     expect(result.toolPaths).toHaveProperty('codex-internal');
+    // Same shape as codex: no rules dir, and an AGENTS.md in user scope only (#938, #945).
     expect(result.toolPaths['codex-internal']).toEqual({
       skills: '.codex-internal/skills',
-      rules: '.codex-internal/rules',
       settings: '.codex-internal/hooks.json',
       agents: '.codex-internal/agents',
+      userScope: { claudemd: '.codex-internal/AGENTS.md' },
     });
   });
 
@@ -258,6 +282,26 @@ describe('TeamaiConfigSchema autoUpdate', () => {
 
   it('rejects non-boolean autoUpdate', () => {
     expect(() => TeamaiConfigSchema.parse({ ...base, autoUpdate: 'nope' })).toThrow();
+  });
+});
+
+describe('TeamaiConfigSchema language (#1014)', () => {
+  const base = {
+    team: 'test-team',
+    repo: 'https://git.woa.com/test/repo.git',
+  };
+
+  it('leaves language undefined when omitted', () => {
+    expect(TeamaiConfigSchema.parse(base).language).toBeUndefined();
+  });
+
+  it('accepts language en and zh', () => {
+    expect(TeamaiConfigSchema.parse({ ...base, language: 'en' }).language).toBe('en');
+    expect(TeamaiConfigSchema.parse({ ...base, language: 'zh' }).language).toBe('zh');
+  });
+
+  it('rejects any other language value', () => {
+    expect(() => TeamaiConfigSchema.parse({ ...base, language: 'english' })).toThrow();
   });
 });
 

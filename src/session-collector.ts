@@ -20,9 +20,11 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureDir } from './utils/fs.js';
+import { ensureDir, writeFileAtomic } from './utils/fs.js';
+import { acquireLock, releaseLock } from './update.js';
 import { redactWithEnv } from './utils/redact.js';
 import { aggregateSessionMetrics } from './dashboard-collector.js';
+import { repoKeys, repoLabel } from './utils/repo-attribution.js';
 import { emptyTokenUsage } from './types.js';
 import type { DashboardEvent, SessionMetrics } from './types.js';
 
@@ -30,6 +32,8 @@ import type { DashboardEvent, SessionMetrics } from './types.js';
 export interface SessionSummary {
   sessionId: string;
   tool: string;
+  /** The session's repo (repoLabel over every session in the log), shared by its worktrees. */
+  project: string;
   cwd: string;
   startedAt: string;
   endedAt: string;
@@ -106,10 +110,12 @@ export function collectSession(sessionId: string, events: DashboardEvent[]): Ses
   const firstPrompt = firstPromptRaw
     ? redactWithEnv(firstPromptRaw).replace(/\s+/g, ' ').trim().slice(0, FIRST_PROMPT_MAX_CHARS)
     : '';
+  const keys = repoKeys(events);
 
   return {
     sessionId,
     tool,
+    project: repoLabel(keys.get(sessionId) ?? '', new Set(keys.values())),
     cwd,
     startedAt,
     endedAt,
@@ -154,7 +160,8 @@ export function renderSessionMarkdown(summary: SessionSummary, options: RenderOp
     `<!-- teamai:session ${summary.sessionId} -->`,
     `### ${date} · ${shortId(summary.sessionId)} · ${summary.tool}`,
     '',
-    `- Project: \`${summary.cwd || 'unknown'}\``,
+    `- Project: \`${summary.project}\``,
+    `- Directory: \`${summary.cwd || 'unknown'}\``,
     `- Prompts: ${summary.prompts} · Tools: ${summary.toolTotal} (${summary.distinctTools} distinct)`,
     `- Interventions: interrupt ${iv.interrupt}, toolReject ${iv.toolReject}, correction ${iv.correction}`,
   ];
@@ -174,7 +181,8 @@ export function monthKey(summary: SessionSummary): string {
  * already present (matched by its full-session-id `<!-- teamai:session … -->`
  * marker) is not appended again. Returns the file path written, or null when the
  * session was already recorded. Creates the directory and a month header on first
- * write.
+ * write. The read/deduplicate/write transaction is serialized across processes;
+ * a busy or unavailable lock is retried for up to five seconds.
  */
 export async function appendMonthlyLog(
   dir: string,
@@ -186,19 +194,32 @@ export async function appendMonthlyLog(
   const file = path.join(dir, `${month}.md`);
   const block = renderSessionMarkdown(summary, options);
   const marker = `<!-- teamai:session ${summary.sessionId} -->`;
-
-  let existing = '';
-  try {
-    existing = await fs.promises.readFile(file, 'utf-8');
-  } catch {
-    // New month.
+  const lockPath = `${file}.lock`;
+  const deadline = Date.now() + 5_000;
+  while (!(await acquireLock(lockPath))) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`Cannot lock session log ${file}. Retry teamai session save later.`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(50, remaining)));
   }
 
-  if (existing.includes(marker)) return null;
+  try {
+    let existing = '';
+    try {
+      existing = await fs.promises.readFile(file, 'utf-8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
 
-  const header = existing ? '' : `# Session log — ${month}\n\n`;
-  await fs.promises.writeFile(file, existing + header + block, 'utf-8');
-  return file;
+    if (existing.includes(marker)) return null;
+
+    const header = existing ? '' : `# Session log — ${month}\n\n`;
+    await writeFileAtomic(file, existing + header + block);
+    return file;
+  } finally {
+    await releaseLock(lockPath);
+  }
 }
 
 /**

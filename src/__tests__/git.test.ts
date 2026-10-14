@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import path from 'node:path';
 
 // Mock simple-git before importing
 const mockGit = {
@@ -20,6 +21,7 @@ const mockGit = {
   pull: vi.fn(),
   fetch: vi.fn(),
   raw: vi.fn(),
+  outputHandler: vi.fn().mockReturnThis(),
 };
 
 vi.mock('simple-git', () => ({
@@ -50,11 +52,32 @@ vi.mock('../utils/logger.js', () => ({
     error: vi.fn(),
     debug: vi.fn(),
     dim: vi.fn(),
+    persist: vi.fn(),
   },
 }));
 
-import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pullRepoFastForward, pushLearningToOrigin } from '../utils/git.js';
+import { generateBranchName, pushRepoBranch, checkoutMaster, pushRepoDirectly, initRepo, configureGitUser, getHeadRev, resetToCleanMaster, isMetadataOnlyDiff, isGitRepo, normalizeRepoUrlForCompare, remotesMatch, redactGitCredentials, pullRepo, pullRepoFastForward, pushLearningToOrigin, gitCommonDir } from '../utils/git.js';
 import fse from 'fs-extra';
+
+describe('gitCommonDir', () => {
+  it('probes a stable checkout only once during a run', async () => {
+    const cwd = path.resolve('common-dir-stable');
+    mockGit.revparse.mockClear().mockResolvedValue('.git');
+
+    expect(await gitCommonDir(cwd)).toBe(path.join(cwd, '.git'));
+    expect(await gitCommonDir(cwd)).toBe(path.join(cwd, '.git'));
+    expect(mockGit.revparse).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries when a repository becomes available after a failed probe', async () => {
+    const cwd = path.resolve('common-dir-retry');
+    mockGit.revparse.mockClear().mockRejectedValueOnce(new Error('not a repository')).mockResolvedValue('.git');
+
+    expect(await gitCommonDir(cwd)).toBeNull();
+    expect(await gitCommonDir(cwd)).toBe(path.join(cwd, '.git'));
+    expect(mockGit.revparse).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe('generateBranchName', () => {
   it('should produce teamai/push/<username>/<timestamp> format', () => {
@@ -65,7 +88,6 @@ describe('generateBranchName', () => {
   it('should use the correct current date components', () => {
     const before = new Date();
     const name = generateBranchName('bob');
-    const after = new Date();
 
     // Extract the date part
     const match = name.match(/^teamai\/push\/bob\/(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})$/);
@@ -127,6 +149,21 @@ describe('pushRepoBranch', () => {
     expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/123']);
     // Should NOT switch back to master — caller does that after gfMrCreate
     expect(mockGit.checkout).not.toHaveBeenCalled();
+  });
+
+  it('should push a newly added empty file', async () => {
+    mockGit.status.mockResolvedValue({ staged: ['empty.md'] });
+    mockGit.diff.mockResolvedValue([
+      'diff --git a/empty.md b/empty.md',
+      'new file mode 100644',
+      'index 0000000..e69de29',
+    ].join('\n'));
+
+    const result = await pushRepoBranch('/repo', 'commit msg', ['empty.md'], 'teamai/push/test/empty');
+
+    expect(result).toBe(true);
+    expect(mockGit.commit).toHaveBeenCalledWith('commit msg', { '--no-verify': null });
+    expect(mockGit.push).toHaveBeenCalledWith(['-u', 'origin', 'teamai/push/test/empty']);
   });
 
   it('should return false and clean up branch when no changes to commit', async () => {
@@ -436,6 +473,22 @@ describe('isMetadataOnlyDiff', () => {
   it('should return true for empty diff', () => {
     expect(isMetadataOnlyDiff('')).toBe(true);
     expect(isMetadataOnlyDiff('  \n  ')).toBe(true);
+  });
+
+  it('should return false for file additions and deletions without content lines', () => {
+    const added = [
+      'diff --git a/empty.md b/empty.md',
+      'new file mode 100644',
+      'index 0000000..e69de29',
+    ].join('\n');
+    const deleted = [
+      'diff --git a/empty.md b/empty.md',
+      'deleted file mode 100644',
+      'index e69de29..0000000',
+    ].join('\n');
+
+    expect(isMetadataOnlyDiff(added)).toBe(false);
+    expect(isMetadataOnlyDiff(deleted)).toBe(false);
   });
 
   it('should return true for timestamp-only changes', () => {

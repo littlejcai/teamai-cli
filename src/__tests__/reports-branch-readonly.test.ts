@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
     listRemote: vi.fn(),
     raw: vi.fn(),
     branchLocal: vi.fn(),
+    revparse: vi.fn(),
   },
   worktreeGit: {
     raw: vi.fn(),
@@ -43,8 +44,16 @@ vi.mock('fs-extra', () => ({
   default: {
     readdir: vi.fn().mockResolvedValue(['.git']),
     remove: vi.fn(),
+    realpath: vi.fn(async (p: string) => p),
   },
 }));
+
+/** The existing reports-wt is a checkout of the business repo: both sides name its git dir. */
+function mockCheckoutOfBusinessRepo(): void {
+  const answer = async (args: string[]) => (args.includes('--git-common-dir') ? '/workspace/project/.git' : 'true');
+  mocks.worktreeGit.revparse.mockImplementation(answer);
+  mocks.repoGit.revparse.mockImplementation(answer);
+}
 
 vi.mock('../update.js', () => ({
   acquireLock: vi.fn(),
@@ -52,7 +61,8 @@ vi.mock('../update.js', () => ({
 }));
 
 import { acquireLock, releaseLock } from '../update.js';
-import { commitAndPushReports, ensureReportsWorktree, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
+import { commitAndPushReports, ensureReportsWorktree, readableReportsWorktree, refreshReportsWorktree, updateReports } from '../utils/reports-branch.js';
+import { ForeignCheckoutError } from '../utils/branch-worktree.js';
 
 const config: LocalConfig = {
   repo: {
@@ -132,6 +142,16 @@ describe('ensureReportsWorktree read-only cold start', () => {
   });
 });
 
+/**
+ * `diff --cached --name-only -z -- <files>` lists `staged`, what the publish commits.
+ * Any other git call is `rev-list --count origin/<branch>..HEAD`, which the publish
+ * checks before reporting success: '0' is "nothing left to deliver".
+ */
+function stageInWorktree(staged: string[]): void {
+  mocks.worktreeGit.raw.mockImplementation(async (args: string[]) =>
+    args.includes('diff') ? staged.map((f) => `${f}\0`).join('') : '0');
+}
+
 describe('commitAndPushReports', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -139,8 +159,8 @@ describe('commitAndPushReports', () => {
     mocks.worktreeGit.add.mockResolvedValue(undefined);
     mocks.worktreeGit.commit.mockResolvedValue(undefined);
     mocks.worktreeGit.push.mockResolvedValue(undefined);
-    mocks.worktreeGit.revparse.mockResolvedValue('true');
-    mocks.worktreeGit.status.mockResolvedValue({ staged: ['members/alice.yaml'] });
+    mockCheckoutOfBusinessRepo();
+    stageInWorktree(['members/alice.yaml']);
     vi.mocked(acquireLock).mockResolvedValue(true);
     vi.mocked(releaseLock).mockResolvedValue(undefined);
   });
@@ -156,7 +176,7 @@ describe('commitAndPushReports', () => {
   });
 
   it('pushes an unchanged report retry without making an empty commit', async () => {
-    mocks.worktreeGit.status.mockResolvedValue({ staged: [] });
+    stageInWorktree([]);
     expect(await commitAndPushReports(config, 'retry stats', ['stats/alice.yaml'], { pushIfUnchanged: true })).toBe(true);
     expect(mocks.worktreeGit.commit).not.toHaveBeenCalled();
     expect(mocks.worktreeGit.push).toHaveBeenCalledWith(['origin', 'teamai-reports']);
@@ -164,7 +184,7 @@ describe('commitAndPushReports', () => {
   });
 
   it('preserves the default no-op when no changes are staged', async () => {
-    mocks.worktreeGit.status.mockResolvedValue({ staged: [] });
+    stageInWorktree([]);
     expect(await commitAndPushReports(config, 'unchanged member', ['members/'])).toBe(false);
     expect(mocks.worktreeGit.push).not.toHaveBeenCalled();
   });
@@ -174,7 +194,7 @@ describe('refreshReportsWorktree', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.isGitRepo.mockResolvedValue(true);
-    mocks.worktreeGit.revparse.mockResolvedValue('true');
+    mockCheckoutOfBusinessRepo();
     mocks.worktreeGit.fetch.mockResolvedValue(undefined);
   });
 
@@ -185,6 +205,19 @@ describe('refreshReportsWorktree', () => {
 
     expect(mocks.worktreeGit.fetch).not.toHaveBeenCalled();
     expect(mocks.worktreeGit.raw).not.toHaveBeenCalled();
+    expect(releaseLock).not.toHaveBeenCalled();
+  });
+
+  it('leaves a missing checkout to the write that holds the lock', async () => {
+    // Every checkout of a self-mode repo shares this path (#808): the holder may
+    // be creating it right now.
+    vi.mocked(acquireLock).mockResolvedValue(false);
+    mocks.isGitRepo.mockResolvedValue(false);
+
+    await refreshReportsWorktree(config, { pushIfCreated: false });
+
+    expect(mocks.isGitRepo).not.toHaveBeenCalled();
+    expect(mocks.repoGit.raw).not.toHaveBeenCalled();
     expect(releaseLock).not.toHaveBeenCalled();
   });
 
@@ -199,6 +232,56 @@ describe('refreshReportsWorktree', () => {
   });
 });
 
+describe('readableReportsWorktree', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCheckoutOfBusinessRepo();
+    mocks.worktreeGit.fetch.mockResolvedValue(undefined);
+  });
+
+  it('returns the local copy without ensuring it while a write holds the lock', async () => {
+    // members, projects members, digest and pull read through here (#808): the
+    // holder may be creating the checkout, so a reader must not add or remove it.
+    vi.mocked(acquireLock).mockResolvedValue(false);
+    mocks.isGitRepo.mockResolvedValue(false);
+
+    await expect(readableReportsWorktree(config)).resolves.toBe(WT);
+
+    expect(mocks.repoGit.raw).not.toHaveBeenCalled();
+    expect(mocks.repoGit.listRemote).not.toHaveBeenCalled();
+  });
+
+  it("refuses another repository's checkout without ensuring it while a write holds the lock", async () => {
+    // After a git<->self switch the checkout at the shared path may be the
+    // other install's: reading it would show that repository's roster and votes.
+    vi.mocked(acquireLock).mockResolvedValue(false);
+    mocks.isGitRepo.mockResolvedValue(true);
+    mocks.worktreeGit.revparse.mockImplementation(async (args: string[]) => (
+      args.includes('--git-common-dir') ? '/workspace/other-team/.git' : 'true'
+    ));
+
+    await expect(readableReportsWorktree(config)).rejects.toBeInstanceOf(ForeignCheckoutError);
+
+    expect(mocks.repoGit.raw).not.toHaveBeenCalled();
+    expect(mocks.repoGit.listRemote).not.toHaveBeenCalled();
+    expect(mocks.worktreeGit.raw).not.toHaveBeenCalled();
+  });
+
+  it('refreshes the checkout, publishing nothing, when the lock is free', async () => {
+    vi.mocked(acquireLock).mockResolvedValue(true);
+    mocks.isGitRepo.mockResolvedValue(true);
+    // A clean checkout, level with origin: the refresh completes.
+    mocks.worktreeGit.status.mockResolvedValue({ staged: [], renamed: [], conflicted: [], isClean: () => true });
+    mocks.worktreeGit.raw.mockResolvedValue('0');
+
+    await expect(readableReportsWorktree(config)).resolves.toBe(WT);
+
+    expect(mocks.worktreeGit.fetch).toHaveBeenCalled();
+    expect(mocks.worktreeGit.push).not.toHaveBeenCalled();
+    expect(releaseLock).toHaveBeenCalledOnce();
+  });
+});
+
 describe('updateReports', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -208,7 +291,7 @@ describe('updateReports', () => {
   it('does not run the write callback when another reports write holds the lock', async () => {
     const write = vi.fn();
 
-    expect(await updateReports(config, write)).toBe(false);
+    expect(await updateReports(config, write)).toEqual({ status: 'busy' });
 
     expect(write).not.toHaveBeenCalled();
     expect(releaseLock).not.toHaveBeenCalled();

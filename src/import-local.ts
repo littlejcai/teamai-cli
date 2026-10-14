@@ -200,7 +200,7 @@ async function persistSession(session: ImportSession, sessionPath: string): Prom
  *
  * 支持两种模式：
  * - dir 模式：扫描指定目录下的 .md/.txt 文件（跳过隐藏文件和 >50KB 文件）
- * - fromClaude 模式：扫描 ~/.claude/rules/ 和 ~/.cursor/rules/ 下的 .md 文件
+ * - fromClaude mode: scans the .md files under the Claude root's rules/ (default ~/.claude, following toolRoots) and ~/.cursor/rules/
  *
  * rawContent 只取前 3000 字符（用于 AI 分类，节省 token）。
  *
@@ -212,6 +212,7 @@ async function persistSession(session: ImportSession, sessionPath: string): Prom
 export async function scanCandidates(opts: {
   dir?: string;
   fromClaude?: boolean;
+  dryRun?: boolean;
 }): Promise<Array<{ path: string; rawContent: string }>> {
   const results: Array<{ path: string; rawContent: string }> = [];
 
@@ -244,8 +245,12 @@ export async function scanCandidates(opts: {
   }
 
   if (opts.fromClaude) {
+    // Claude's rules follow a relocated root (CLAUDE_CONFIG_DIR); Cursor's do not move.
+    const { resolveMemberToolRoots } = await import('./config.js');
+    const { resolveToolRootDir, CLAUDE_TOOL_ID, DEFAULT_CLAUDE_ROOT } = await import('./types.js');
+    const claudeRoot = resolveToolRootDir(CLAUDE_TOOL_ID, DEFAULT_CLAUDE_ROOT, await resolveMemberToolRoots(undefined, { dryRun: opts.dryRun }));
     const rulesBaseDirs = [
-      expandHome('~/.claude/rules'),
+      path.join(claudeRoot, 'rules'),
       expandHome('~/.cursor/rules'),
     ];
     for (const baseDir of rulesBaseDirs) {
@@ -436,13 +441,12 @@ export async function interactiveReview(
 
     process.stdout.write('\n');
     process.stdout.write(`[${currentIndex}/${total}] 📄 ${title} (${itemType})\n`);
-    process.stdout.write(`  路径: ${sessionItem.sourcePath ?? ''}\n`);
-    process.stdout.write(`  摘要: ${summary}\n`);
+    process.stdout.write(`  Path: ${sessionItem.sourcePath ?? ''}\n`);
+    process.stdout.write(`  Summary: ${summary}\n`);
     process.stdout.write(`  Tags: ${tags.join(', ')}\n`);
 
     let answered = false;
     while (!answered) {
-      // eslint-disable-next-line no-await-in-loop
       const input = await question('[A]ccept  [E]dit  [S]kip  > ');
       const choice = input.trim().toLowerCase();
 
@@ -453,8 +457,7 @@ export async function interactiveReview(
         sessionItem.status = 'skipped';
         answered = true;
       } else if (choice === 'e') {
-        // eslint-disable-next-line no-await-in-loop
-        const newTitle = await question('  新标题: ');
+        const newTitle = await question('  New title: ');
         const trimmedTitle = newTitle.trim();
         if (trimmedTitle.length > 0 && sessionItem.learningDraft) {
           sessionItem.learningDraft.title = trimmedTitle;
@@ -466,14 +469,13 @@ export async function interactiveReview(
         sessionItem.status = 'edited';
         answered = true;
       } else {
-        process.stdout.write('  请输入 A（接受）、E（编辑）或 S（跳过）\n');
+        process.stdout.write('  Enter A (accept), E (edit) or S (skip)\n');
       }
     }
 
     processedCount++;
     session.progress = processedCount;
     // 每次选择后立即持久化，支持中断恢复
-    // eslint-disable-next-line no-await-in-loop
     await persistSession(session, sessionPath);
   }
 
@@ -543,10 +545,10 @@ export async function pushAccepted(
     try {
       await ensureDir(destDir);
       await writeFile(destPath, draft.content);
-      log.info(`已写入: ${destPath}`);
+      log.info(`Wrote: ${destPath}`);
       pushed++;
     } catch (err: unknown) {
-      log.error(`写入失败 [${destPath}]: ${String(err)}`);
+      log.error(`Failed to write [${destPath}]: ${String(err)}`);
       skipped++;
     }
   }

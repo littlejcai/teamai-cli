@@ -7,7 +7,8 @@ const testRoot = await fse.mkdtemp(path.join(os.tmpdir(), 'teamai-pull-learnings
 const originalHome = process.env.HOME;
 process.env.HOME = path.join(testRoot, 'home');
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   requireInit: vi.fn(),
   loadState: vi.fn().mockResolvedValue({ lastPull: null, lastPullRev: null }),
   saveState: vi.fn(),
@@ -21,6 +22,8 @@ vi.mock('../config.js', () => ({
 vi.mock('../utils/git.js', () => ({
   pullRepo: vi.fn().mockResolvedValue('already up to date'),
   getHeadRev: vi.fn().mockResolvedValue('abc1234'),
+  // No learnings checkout exists, so the index's ownership probe passes (#808).
+  isGitRepo: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock('../utils/logger.js', () => ({
@@ -38,7 +41,9 @@ vi.mock('../utils/logger.js', () => ({
 vi.mock('../source.js', () => ({ pullSources: vi.fn().mockResolvedValue(undefined) }));
 vi.mock('../hooks.js', () => ({
   injectHooksToAllTools: vi.fn().mockResolvedValue(undefined),
-  reconcileTeamHooksForConfig: vi.fn().mockResolvedValue([]),
+  reconcileTeamHooksForConfig: vi.fn().mockResolvedValue({ ok: true, defs: [] }),
+  deliveredHookFiles: vi.fn().mockResolvedValue([]),
+  unreadableHookFiles: vi.fn().mockResolvedValue([]),
 }));
 vi.mock('../mcp-reconcile.js', () => ({
   reconcileMcpForConfig: vi.fn().mockResolvedValue({ changes: [], wrote: false }),
@@ -47,6 +52,7 @@ vi.mock('../team-push.js', () => ({ reportUsageToTeam: vi.fn().mockResolvedValue
 vi.mock('../usage-tracker.js', () => ({
   readUsageEvents: vi.fn().mockResolvedValue([]),
   truncateUsageAfterReport: vi.fn().mockResolvedValue(undefined),
+  capUsageEvents: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock('../roles.js', () => ({
   loadRolesManifest: vi.fn().mockResolvedValue({

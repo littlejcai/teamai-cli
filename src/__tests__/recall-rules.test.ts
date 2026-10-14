@@ -19,7 +19,7 @@ vi.mock('../utils/logger.js', () => ({
   })),
 }));
 
-import { compileRecallRulesBlock } from '../pull.js';
+import { compileDirectRecallRulesBlock, compileRecallRulesBlock } from '../pull.js';
 import { injectClaudeMdSection } from '../utils/claudemd.js';
 import { TEAMAI_RECALL_RULES_START, TEAMAI_RECALL_RULES_END } from '../types.js';
 
@@ -31,12 +31,22 @@ describe('compileRecallRulesBlock', () => {
     // Rule 1: must call teamai-recall before tasks
     expect(block).toMatch(/teamai-recall/);
     expect(block).toMatch(/Before/i);
-    // Rule 2: must declare referenced-doc-ids after task
-    expect(block).toContain('teamai:referenced-doc-ids');
   });
 
   it('is idempotent (same input produces same output)', () => {
     expect(compileRecallRulesBlock()).toBe(compileRecallRulesBlock());
+  });
+});
+
+describe('compileDirectRecallRulesBlock (#945)', () => {
+  it('tells a tool without the recall subagent to run teamai recall itself, inside the same markers', () => {
+    const block = compileDirectRecallRulesBlock();
+    expect(block.startsWith(TEAMAI_RECALL_RULES_START)).toBe(true);
+    expect(block.endsWith(TEAMAI_RECALL_RULES_END)).toBe(true);
+    expect(block).toContain('teamai recall "');
+    expect(block).toMatch(/Before/);
+    expect(block).not.toContain('teamai-recall');
+    expect(block).not.toMatch(/[\u4e00-\u9fff]/);
   });
 });
 
@@ -102,7 +112,7 @@ Custom user content below.
     // New block present
     expect(content).toContain('teamai-recall');
     // Only one occurrence of the markers
-    const startMatches = content.match(new RegExp(TEAMAI_RECALL_RULES_START.replace(/[\[\]\-]/g, '\\$&'), 'g')) ?? [];
+    const startMatches = content.match(new RegExp(TEAMAI_RECALL_RULES_START.replace(/[[\]-]/g, '\\$&'), 'g')) ?? [];
     expect(startMatches.length).toBe(1);
   });
 

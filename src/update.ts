@@ -11,7 +11,7 @@ import { resolveTeamaiEntryScript } from './builtin-hooks.js';
 import { log } from './utils/logger.js';
 import { expandHome, ensureDir } from './utils/fs.js';
 import { getUpdateLockPath } from './types.js';
-import { askConfirmation } from './utils/prompt.js';
+import { askConfirmation, isInteractive } from './utils/prompt.js';
 
 // `getCurrentVersion` and `getCurrentPackageName` live in `./package-info.ts`
 // so both this module and the provider registry can read package metadata
@@ -111,8 +111,8 @@ export function prefixFromEntryPath(entry: string, posix: boolean): { prefix: st
  * Resolve the install target the running CLI lives in
  * (<prefix>/[lib/]node_modules/<pkg>/...) so a self-update reinstalls into
  * the same location. Returns null when the entry cannot be attributed to an
- * npm-managed install (e.g. a linked checkout) — callers then keep the
- * default global install behavior.
+ * npm-managed install (e.g. a linked checkout) — callers must not install
+ * then, since npm's default global prefix is where `npm link` put its symlink.
  */
 function resolveInstallPrefix(): { prefix: string; global: boolean } | null {
   return prefixFromEntryPath(fileURLToPath(import.meta.url), process.platform !== 'win32');
@@ -215,7 +215,10 @@ function parseLockContent(content: string): { pid: number; owner?: string } | nu
   const trimmed = content.trim();
   if (!trimmed) return null;
   try {
-    const parsed = JSON.parse(trimmed) as Partial<LockPayload>;
+    const json: unknown = JSON.parse(trimmed);
+    // Legacy format: a bare PID, which is valid JSON too.
+    if (typeof json === 'number') return Number.isInteger(json) ? { pid: json } : null;
+    const parsed = json as Partial<LockPayload>;
     if (typeof parsed.pid === 'number' && !isNaN(parsed.pid)) {
       return { pid: parsed.pid, owner: typeof parsed.owner === 'string' ? parsed.owner : undefined };
     }
@@ -228,34 +231,84 @@ function parseLockContent(content: string): { pid: number; owner?: string } | nu
 }
 
 /**
- * Inspect the lock at `resolved` and report whether it is stale — its owning
- * process is gone, or its contents are unparseable (so no live owner can be
- * confirmed). A missing file is also "stale" (nothing holds it). This is a pure
- * read; it never mutates the lock.
+ * Inspect the lock at `resolved`: held by a live process, stale (its owning
+ * process is gone), or missing. This is a pure read; it never mutates the lock.
+ *
+ * Only a verdict of stale lets a reclaimer rename over the lock, so only a
+ * lock whose owner is provably gone reads as stale (#760). Anything that
+ * cannot name a dead owner is held: a file denied by permissions (EACCES, e.g.
+ * another user's 0600 lock), an empty or partly written one (its creator may
+ * still be writing it: the O_EXCL fallback and older teamai open the file
+ * before writing), and a pid that exists but belongs to another user (EPERM).
+ * A lock that names no owner, or is permission-denied, stays until removed by hand
+ * if a crash left it, so it is named in a warning.
  */
-async function isLockStale(resolved: string): Promise<boolean> {
+export async function lockState(resolved: string): Promise<'live' | 'stale' | 'missing'> {
   let content: string;
   try {
     content = await fse.readFile(resolved, 'utf-8');
-  } catch {
-    // File vanished between EEXIST and read — treat as reclaimable.
-    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return 'missing';
+    if (code !== 'EACCES' && code !== 'EPERM') throw err;
+    log.warn(`${resolved} cannot be read (${code}); treating it as held. Remove it if no teamai process is running.`);
+    return 'live';
   }
   const parsed = parseLockContent(content);
-  if (!parsed) return true; // unparseable → no confirmable live owner
+  if (!parsed) {
+    log.warn(`${resolved} names no owner; treating it as held. Remove it if no teamai process is running.`);
+    return 'live';
+  }
   try {
     process.kill(parsed.pid, 0);
-    return false; // process alive → lock genuinely held
-  } catch {
-    return true; // ESRCH → owning process is gone
+    return 'live'; // process alive → lock genuinely held
+  } catch (err) {
+    // EPERM: alive, owned by another user. ESRCH: the owning process is gone.
+    return (err as NodeJS.ErrnoException).code === 'EPERM' ? 'live' : 'stale';
   }
 }
 
 /**
+ * Create the lock, or report who has it. A lock released between the failed
+ * create and the read gets one more create: renaming over it could replace a
+ * lock a third process just made, and reporting busy would turn a free lock
+ * away (#760).
+ */
+async function createOrInspect(resolved: string, payload: string): Promise<'acquired' | 'live' | 'stale'> {
+  if (await exclusiveCreate(resolved, payload)) return 'acquired';
+  const state = await lockState(resolved);
+  if (state !== 'missing') return state;
+  return (await exclusiveCreate(resolved, payload)) ? 'acquired' : 'live';
+}
+
+/**
  * Atomic exclusive create. Returns true when this call created the file, false
- * when it already existed (EEXIST). Any other error propagates.
+ * when it already existed (EEXIST). Any error other than EEXIST from the O_EXCL
+ * create propagates.
+ *
+ * The payload is written to a private temp file first and hard-linked to
+ * `target`, which fails with EEXIST exactly like O_EXCL, so the lock never
+ * exists without its content (#760): a contender never sees a lock that names
+ * no owner, and an older teamai, which reclaims such a lock at once, cannot take
+ * it over mid-create. A filesystem without hard links falls
+ * back to O_EXCL, where the file is opened before it is written; lockState
+ * never reclaims such a file while it names no dead owner.
  */
 async function exclusiveCreate(target: string, payload: string): Promise<boolean> {
+  const tmp = `${target}.${randomUUID()}.tmp`;
+  await fse.writeFile(tmp, payload);
+  try {
+    await fse.link(tmp, target);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    return await exclusiveCreateInPlace(target, payload);
+  } finally {
+    await fse.remove(tmp).catch(() => {});
+  }
+}
+
+async function exclusiveCreateInPlace(target: string, payload: string): Promise<boolean> {
   try {
     await fse.writeFile(target, payload, { flag: 'wx' });
     return true;
@@ -302,64 +355,80 @@ async function acquireReclaimSentinel(sentinel: string, owner: string): Promise<
   } satisfies LockPayload);
   if (await exclusiveCreate(sentinel, payload)) return true;
   // Sentinel is held. Only reclaim it if its holder is gone.
-  if (!(await isLockStale(sentinel))) return false;
+  if ((await lockState(sentinel)) !== 'stale') return false;
   try {
     await fse.rename(sentinel, `${sentinel}.reclaim-${owner}`);
-  } catch {
-    return false; // another process stole it first
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false; // another process stole it first
+    throw err;
   }
   await fse.remove(`${sentinel}.reclaim-${owner}`).catch(() => {});
   return exclusiveCreate(sentinel, payload);
 }
 
 /**
- * Try to acquire a lock. Returns false if another live process holds it.
+ * Try to acquire a lock. Returns false when the lock is held (including a
+ * permission-denied or ownerless existing lock); filesystem failures reject
+ * with the lock path and original cause, so callers do not retry them as contention.
  *
- * The happy path is a single atomic exclusive create (`writeFile(..., { flag: 'wx' })`
- * = O_CREAT|O_EXCL), so exactly one racing process wins an uncontended lock — this
- * replaces the previous check-then-write, where two processes could both observe
- * "no lock" and both succeed.
+ * The happy path is a single atomic exclusive create (a fully written temp file
+ * hard-linked to the lock name, or O_CREAT|O_EXCL without hard links), so exactly
+ * one racing process wins an uncontended lock — this replaces the previous
+ * check-then-write, where two processes could both observe "no lock" and both
+ * succeed.
  *
- * Reclaiming a STALE lock (dead owner / unparseable content) is serialized behind
- * a reclaim sentinel and completed with an atomic rename-into-place, so concurrent
- * reclaimers cannot each end up believing they hold the lock. (A residual, benign
- * window exists only if the reclaiming process itself crashes mid-reclaim; the
- * sentinel's dead-pid recovery bounds that.)
+ * Reclaiming a STALE lock (its owner is provably dead; see lockState) is serialized
+ * behind a reclaim sentinel and completed with an atomic rename-into-place, so
+ * concurrent reclaimers cannot each end up believing they hold the lock. (A
+ * residual window exists only if the reclaiming process itself dies mid-reclaim:
+ * stealing its dead-pid sentinel is not yet race-free, see #760.)
  */
-export async function acquireLock(lockPath?: string): Promise<boolean> {
+export async function acquireLock(
+  lockPath?: string,
+  options: { dryRun?: boolean } = {},
+): Promise<boolean> {
   const resolved = lockPath ?? expandHome(getUpdateLockPath());
-  const owner = randomUUID();
-  const payload = JSON.stringify({
-    pid: process.pid,
-    startedAt: new Date().toISOString(),
-    owner,
-  } satisfies LockPayload);
-
+  // A preview does not take the lock, because taking one is itself a write:
+  // `ensureDir` below creates the lock's parent directory, which a fresh
+  // self-mode clone has no partition for yet and which `releaseLock` has no
+  // reason to remove — the directory would outlive the command (#866). What the
+  // preview still owes its caller is the ANSWER the real command would get, so
+  // it reads the lock's state instead of creating it: a live holder means the
+  // real run would have reported contention, anything else means it would have
+  // won. No owner is recorded, so `releaseLock` has nothing to undo.
   try {
+    if (options.dryRun) return (await lockState(resolved)) !== 'live';
+    const owner = randomUUID();
+    const payload = JSON.stringify({
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+      owner,
+    } satisfies LockPayload);
+
+    // From the first real lock on, a best-effort sweep at process exit removes
+    // whatever this process still holds (#1027). Dry runs never register it.
+    ensureExitSweep();
     await ensureDir(path.dirname(resolved));
-  } catch {
-    return false;
-  }
-
-  try {
-    // Fast path: no lock present.
-    if (await exclusiveCreate(resolved, payload)) {
+    // Fast path: no lock present. A live holder means busy; only a stale lock
+    // may be reclaimed.
+    const first = await createOrInspect(resolved, payload);
+    if (first === 'acquired') {
       heldLockOwners.set(resolved, owner);
       return true;
     }
-    // A lock exists. A live holder means busy; only a stale one may be reclaimed.
-    if (!(await isLockStale(resolved))) return false;
+    if (first === 'live') return false;
 
     // Serialize the reclaim so only one process takes over the stale lock.
     const sentinel = `${resolved}.sentinel`;
     if (!(await acquireReclaimSentinel(sentinel, owner))) return false;
     try {
       // Re-evaluate now that we are the sole reclaimer.
-      if (await exclusiveCreate(resolved, payload)) {
+      const second = await createOrInspect(resolved, payload);
+      if (second === 'acquired') {
         heldLockOwners.set(resolved, owner);
         return true; // stale lock had vanished
       }
-      if (!(await isLockStale(resolved))) return false; // became live under us
+      if (second === 'live') return false; // became live under us
       // Still stale and present, and no other reclaimer can race us: replace it
       // atomically (write to a temp sibling, then rename over the stale file, so
       // the lock is never momentarily absent for a fresh acquirer to slip into).
@@ -371,8 +440,8 @@ export async function acquireLock(lockPath?: string): Promise<boolean> {
     } finally {
       await removeIfOwner(sentinel, owner);
     }
-  } catch {
-    return false;
+  } catch (err) {
+    throw new Error(`Cannot acquire lock ${resolved}: ${(err as Error).message}`, { cause: err });
   }
 }
 
@@ -402,6 +471,136 @@ export async function releaseLock(lockPath?: string): Promise<void> {
   }
 }
 
+/**
+ * Synchronously remove the locks this process still holds when it exits —
+ * the same owner-verified removal `releaseLock` does, but with sync fs calls,
+ * because `process.on('exit')` handlers cannot await (#1027).
+ *
+ * This closes the common residue paths: a hook host's hard `process.exit(0)`
+ * while best-effort background work (the auto-report) still holds a lock, and
+ * any exit that skips a `finally releaseLock`. It cannot help against what no
+ * process can catch (SIGKILL, a Windows job-object teardown): those locks stay
+ * for the next `acquireLock` of the same path to reclaim, and for
+ * `teamai doctor` to report. Errors are ignored: a lock that cannot be read is
+ * left behind rather than guessed about.
+ */
+export function sweepHeldLocksOnExit(): void {
+  for (const [resolved, owner] of heldLockOwners) {
+    try {
+      const content = fs.readFileSync(resolved, 'utf-8');
+      const parsed = parseLockContent(content);
+      if (parsed?.owner && parsed.owner !== owner) continue; // someone else's now
+      fs.rmSync(resolved, { force: true });
+    } catch {
+      // best effort
+    }
+  }
+  heldLockOwners.clear();
+}
+
+let exitSweepRegistered = false;
+
+/** Register the exit sweep once, when this process first takes a real lock. */
+function ensureExitSweep(): void {
+  if (exitSweepRegistered) return;
+  exitSweepRegistered = true;
+  process.on('exit', sweepHeldLocksOnExit);
+}
+
+/** The named locks the acquireLock family writes (no `.lock` suffix). */
+const LOCK_BASENAMES = new Set([
+  '.update-lock',
+  '.sync-lock',
+  '.reports-lock',
+  '.learnings-lock',
+  '.bootstrap-lock',
+  '.local-agent-sync-lock',
+  '.source-lifecycle-lock',
+]);
+
+/**
+ * Every lock file under `roots` that the acquireLock family may have written:
+ * the shared named locks, plus the per-file `<name>.lock` siblings (votes,
+ * queue, secrets, models, …). `.git` and `node_modules` subtrees are skipped:
+ * locks sit beside what they guard, never inside those.
+ */
+async function walkLockCandidates(roots: string[]): Promise<string[]> {
+  const found: string[] = [];
+  const queue = [...roots];
+  while (queue.length > 0) {
+    const dir = queue.shift()!;
+    let entries: fs.Dirent[];
+    try {
+      entries = await fse.readdir(dir, { withFileTypes: true });
+    } catch {
+      continue; // missing or unreadable directory
+    }
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === '.git' || entry.name === 'node_modules') continue;
+        queue.push(p);
+      } else if (entry.isFile() && (LOCK_BASENAMES.has(entry.name) || entry.name.endsWith('.lock'))) {
+        found.push(p);
+      }
+    }
+  }
+  return found;
+}
+
+/** True when `content` is a lock payload whose owning process is provably gone. */
+function isDeadPidLock(content: string): boolean {
+  const parsed = parseLockContent(content);
+  if (!parsed) return false; // names no owner: never provably stale (#760)
+  try {
+    process.kill(parsed.pid, 0);
+    return false;
+  } catch (err) {
+    // EPERM: the pid exists, owned by another user. Anything else: gone.
+    return (err as NodeJS.ErrnoException).code !== 'EPERM';
+  }
+}
+
+/**
+ * Lock files under `roots` whose owning process is dead — the zombies #1027
+ * reports. A lock held by a live process, or one that names no owner (the
+ * dashboard's raw-O_EXCL locks, an empty file mid-create), is never listed:
+ * only a provably dead pid makes a lock removable.
+ */
+export async function listZombieLocks(roots: string[]): Promise<string[]> {
+  const zombies: string[] = [];
+  for (const p of await walkLockCandidates(roots)) {
+    try {
+      if (isDeadPidLock(await fse.readFile(p, 'utf-8'))) zombies.push(p);
+    } catch {
+      // unreadable: leave it alone
+    }
+  }
+  return zombies;
+}
+
+/**
+ * Remove the zombie locks under `roots`, returning the removed paths. Each one
+ * is reclaimed through `acquireLock`/`releaseLock` — the same serialized,
+ * owner-verified takeover the next real writer of that lock would run — so a
+ * lock that became live again mid-cleanup is adopted and released, never
+ * deleted out from under its holder.
+ */
+export async function removeZombieLocks(roots: string[]): Promise<string[]> {
+  const removed: string[] = [];
+  for (const p of await listZombieLocks(roots)) {
+    try {
+      if (await acquireLock(p)) {
+        await releaseLock(p);
+        removed.push(p);
+      }
+    } catch {
+      // filesystem failure: report it as still present by not removing it
+    }
+  }
+  return removed;
+}
+
 // ─── Core logic ─────────────────────────────────────────
 
 export interface CheckResult {
@@ -414,18 +613,17 @@ export interface CheckResult {
  * Check if a newer version is available.
  * Uses cached result if within TTL unless force is true.
  */
-export async function checkForUpdate(options?: { force?: boolean }): Promise<CheckResult> {
+export async function checkForUpdate(options?: { force?: boolean; dryRun?: boolean }): Promise<CheckResult> {
   const state = await loadState();
   const current = getCurrentVersion();
 
   // Use cached result if valid
-  if (!options?.force && isCacheValid(state.lastUpdateCheck) && state.availableUpdate) {
-    const cmp = compareVersions(current, state.availableUpdate);
-    return {
-      available: cmp < 0,
-      current,
-      latest: state.availableUpdate,
-    };
+  if (!options?.force && isCacheValid(state.lastUpdateCheck)) {
+    if (state.availableUpdate) {
+      const cmp = compareVersions(current, state.availableUpdate);
+      return { available: cmp < 0, current, latest: state.availableUpdate };
+    }
+    return { available: false, current, latest: current };
   }
 
   // Fetch latest version from registry
@@ -436,11 +634,13 @@ export async function checkForUpdate(options?: { force?: boolean }): Promise<Che
 
   // Compare and save state
   const available = compareVersions(current, latest) < 0;
-  await saveState({
-    ...state,
-    lastUpdateCheck: new Date().toISOString(),
-    availableUpdate: available ? latest : null,
-  });
+  if (!options?.dryRun) {
+    await saveState({
+      ...state,
+      lastUpdateCheck: new Date().toISOString(),
+      availableUpdate: available ? latest : null,
+    });
+  }
 
   return { available, current, latest };
 }
@@ -471,8 +671,42 @@ export async function doUpdate(): Promise<void> {
     return;
   }
 
+  // Refuse unsupported install layouts before prompting, so nobody confirms
+  // an update that is then skipped.
+  const pkgName = getCurrentPackageName();
+  const registry = resolveRegistryForPackage(pkgName);
+  const target = resolveInstallPrefix();
+  if (!target) {
+    // A prefix-less `npm install -g` would land in npm's default global
+    // prefix — for an `npm link` checkout that replaces the symlink with the
+    // registry copy, so the checkout silently stops being the CLI that runs.
+    // Hooks discard stderr, so debug.log keeps the record.
+    const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+    const message =
+      `Self-update skipped: teamai is running from ${root}, which is not an npm install ` +
+      'it can update in place (for example an `npm link` checkout). For a checkout, pull ' +
+      'and rebuild it; to switch to the published package, run ' +
+      `"npm install -g ${pkgName} --registry=${registry}".`;
+    log.warn(message);
+    log.persist(message);
+    return;
+  }
+  if (!target.global) {
+    // POSIX vendored (flat) layouts cannot be reinstalled by npm without
+    // destroying the tree: a non-global install reconciles <prefix> as a
+    // project and prunes every undeclared sibling in <prefix>/node_modules
+    // (including a co-located npm), while -g always lands in
+    // <prefix>/lib. Stay out and let the user update manually.
+    const message =
+      `Self-update is not supported for the vendored install at ${target.prefix} ` +
+      '(npm would relocate or prune the runtime tree) — update manually.';
+    log.warn(message);
+    log.persist(message);
+    return;
+  }
+
   if (policy === 'prompt') {
-    if (!process.stdin.isTTY) {
+    if (!isInteractive()) {
       log.info(`Update available: v${result.current} → v${result.latest}. Run "teamai update" to upgrade.`);
       return;
     }
@@ -493,28 +727,13 @@ export async function doUpdate(): Promise<void> {
   }
 
   try {
-    const pkgName = getCurrentPackageName();
-    const registry = resolveRegistryForPackage(pkgName);
     const npm = resolveNpmCommand();
-    const target = resolveInstallPrefix();
-    if (target && !target.global) {
-      // POSIX vendored (flat) layouts cannot be reinstalled by npm without
-      // destroying the tree: a non-global install reconciles <prefix> as a
-      // project and prunes every undeclared sibling in <prefix>/node_modules
-      // (including a co-located npm), while -g always lands in
-      // <prefix>/lib. Stay out and let the user update manually.
-      log.warn(
-        `Self-update is not supported for the vendored install at ${target.prefix} ` +
-        '(npm would relocate or prune the runtime tree) — update manually.',
-      );
-      return;
-    }
     await execFileAsync(
       npm.cmd,
       [
         ...npm.args,
         'install', '-g', pkgName,
-        ...(target ? [`--prefix=${target.prefix}`] : []),
+        `--prefix=${target.prefix}`,
         `--registry=${registry}`,
       ],
       { timeout: INSTALL_TIMEOUT, windowsHide: true },
@@ -523,10 +742,8 @@ export async function doUpdate(): Promise<void> {
 
     const entry = resolveTeamaiEntryScript();
 
-    // Verify the RUNNING install actually changed. A null target (linked
-    // checkout, exotic layout) updates npm's default global prefix — which is
-    // not necessarily where this process runs from — and a stale success
-    // message here is exactly how self-update silently stops working.
+    // Verify the RUNNING install actually changed: a stale success message
+    // here is exactly how self-update silently stops working.
     if (entry) {
       try {
         const installed = JSON.parse(fs.readFileSync(
@@ -584,11 +801,12 @@ export interface UpdateOptions {
 /**
  * Main entry point for `teamai update` command.
  * --check: only check and print whether an update is available
+ * --dry-run: check without installing or saving the version-check state
  * default: full update flow (check + install)
  */
 export async function update(options: UpdateOptions): Promise<void> {
-  if (options.check) {
-    const result = await checkForUpdate();
+  if (options.check || options.dryRun) {
+    const result = await checkForUpdate({ dryRun: options.dryRun });
     if (result.available) {
       log.info(`Update available: v${result.current} → v${result.latest}. Run "teamai update" to upgrade.`);
     } else {

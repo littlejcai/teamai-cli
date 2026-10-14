@@ -128,6 +128,22 @@ export async function upsertSoulRules(rulesText: string): Promise<void> {
 }
 
 /**
+ * The text inside the teamai-managed block of SOUL.md, or null when the block
+ * is not there. Read-only: `doctor` has to compare what Hermes actually reads
+ * with what `upsertSoulRules` would write, and reusing the writer to find out
+ * would edit the file the command is only meant to describe.
+ */
+export async function readSoulRules(): Promise<string | null> {
+  const content = await readFileSafe(getHermesSoulPath());
+  if (content === null) return null;
+
+  const startIdx = content.indexOf(RULES_BLOCK_START);
+  const endIdx = content.indexOf(RULES_BLOCK_END);
+  if (startIdx === -1 || endIdx === -1 || endIdx < startIdx) return null;
+  return content.slice(startIdx + RULES_BLOCK_START.length, endIdx).trim();
+}
+
+/**
  * Remove the teamai-managed rules block from Hermes SOUL.md, leaving user
  * content intact. No-op when nothing is present.
  */
@@ -162,11 +178,12 @@ interface AllowlistFile {
  * @param event - The hook event name (e.g. `on_session_start`).
  * @param entry - Hook descriptor; `matcher` and `timeout` are omitted when
  *   undefined so the YAML does not contain null values.
+ * @returns Whether config.yaml was written.
  */
 export async function upsertHermesHook(
   event: string,
   entry: { command: string; matcher?: string; timeout?: number },
-): Promise<void> {
+): Promise<boolean> {
   const doc = await readConfigDoc();
 
   // Get current hooks[event] as a plain JS array.
@@ -182,10 +199,11 @@ export async function upsertHermesHook(
 
   const newArr = [...untouched, cleanEntry];
 
-  if (JSON.stringify(arr) === JSON.stringify(newArr)) return;
+  if (JSON.stringify(arr) === JSON.stringify(newArr)) return false;
 
   doc.setIn(['hooks', event], newArr);
   await writeConfigDoc(doc);
+  return true;
 }
 
 /**
@@ -242,18 +260,20 @@ export async function removeHermesHookByCommand(command: string): Promise<void> 
  *
  * @param event   - Hook event name.
  * @param command - Absolute path to the approved script.
+ * @returns Whether the allowlist was written.
  */
-export async function addHermesAllowlist(event: string, command: string): Promise<void> {
+export async function addHermesAllowlist(event: string, command: string): Promise<boolean> {
   const filePath = getHermesAllowlistPath();
   const raw = await readJson<AllowlistFile>(filePath);
   const data: AllowlistFile =
     raw && Array.isArray(raw.approvals) ? raw : { approvals: [] };
 
   const exists = data.approvals.some((a) => a.event === event && a.command === command);
-  if (exists) return;
+  if (exists) return false;
 
   data.approvals.push({ event, command });
   await writeJson(filePath, data);
+  return true;
 }
 
 /**
@@ -274,4 +294,48 @@ export async function removeHermesAllowlist(event: string, command: string): Pro
   if (filtered.length === raw.approvals.length) return;
 
   await writeJson(filePath, { approvals: filtered });
+}
+
+/**
+ * Add `name` to `plugins.enabled` in the Hermes config.yaml: Hermes loads no
+ * user plugin that is not listed there. A name the member put under
+ * `plugins.disabled` stays off. Returns whether config.yaml was written.
+ */
+export async function enableHermesPlugin(name: string): Promise<boolean> {
+  const doc = await readConfigDoc();
+  const disabled = doc.getIn(['plugins', 'disabled']);
+  if (YAML.isSeq(disabled) && (disabled.toJSON() as unknown[]).includes(name)) return false;
+  const enabled = doc.getIn(['plugins', 'enabled']);
+  const list = YAML.isSeq(enabled) ? (enabled.toJSON() as unknown[]) : [];
+  if (list.includes(name)) return false;
+  doc.setIn(['plugins', 'enabled'], [...list, name]);
+  await writeConfigDoc(doc);
+  return true;
+}
+
+/** Remove `name` from `plugins.enabled` in the Hermes config.yaml, dropping keys left empty. */
+export async function disableHermesPlugin(name: string): Promise<void> {
+  const doc = await readConfigDoc();
+  const enabled = doc.getIn(['plugins', 'enabled']);
+  if (!YAML.isSeq(enabled)) return;
+  const list = enabled.toJSON() as unknown[];
+  if (!list.includes(name)) return;
+  const rest = list.filter((entry) => entry !== name);
+  if (rest.length > 0) doc.setIn(['plugins', 'enabled'], rest);
+  else doc.deleteIn(['plugins', 'enabled']);
+  const plugins = doc.getIn(['plugins']);
+  if (YAML.isMap(plugins) && plugins.items.length === 0) doc.deleteIn(['plugins']);
+  await writeConfigDoc(doc);
+}
+
+/** Whether the member put `name` in `plugins.disabled`, which enabling leaves alone. */
+export async function isHermesPluginDisabled(name: string): Promise<boolean> {
+  const disabled = (await readConfigDoc()).getIn(['plugins', 'disabled']);
+  return YAML.isSeq(disabled) && (disabled.toJSON() as unknown[]).includes(name);
+}
+
+/** Whether `name` is in `plugins.enabled` of the Hermes config.yaml. */
+export async function isHermesPluginEnabled(name: string): Promise<boolean> {
+  const enabled = (await readConfigDoc()).getIn(['plugins', 'enabled']);
+  return YAML.isSeq(enabled) && (enabled.toJSON() as unknown[]).includes(name);
 }

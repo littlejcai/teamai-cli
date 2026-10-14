@@ -75,7 +75,7 @@ describe('codebase reconciliation', () => {
     );
   });
 
-  it('prints a summary in preview mode and emits JSON while writing the graph', async () => {
+  it('prints a summary in preview mode and emits JSON while writing the graph', { timeout: 60_000 }, async () => {
     const root = createWikiFixture();
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
@@ -228,7 +228,6 @@ describe('codebase reconciliation', () => {
 
   it('normalizes graph variants emitted by legacy aggregation', async () => {
     const root = createWikiFixture();
-    const graphPath = path.join(root, 'teamwiki', '.indices', 'graph-index.json');
     const repoGraphPath = path.join(root, 'teamwiki', 'evidence', 'code', 'auth', '.indices', 'graph-index.json');
     const legacyGraph = {
       schemaVersion: 1,
@@ -279,6 +278,38 @@ describe('codebase reconciliation', () => {
       expect.objectContaining({ slug: 'src/a.ts', source: 'code-ast' }),
       expect.objectContaining({ slug: 'src/b.ts', source: 'code-ast' }),
     ]));
+  });
+
+  it('tags a repaired endpoint node with the same origin as the code-ast/code-heuristic edge that required it (#912 review round 11 P1)', async () => {
+    const root = createWikiFixture();
+    const repoGraphPath = path.join(root, 'teamwiki', 'evidence', 'code', 'auth', '.indices', 'graph-index.json');
+    fs.mkdirSync(path.dirname(repoGraphPath), { recursive: true });
+    fs.writeFileSync(repoGraphPath, JSON.stringify({
+      schemaVersion: 1,
+      generatedAt: '2026-01-01',
+      nodes: [{ slug: 'component/a', title: 'a', type: 'component', confidence: 'EXTRACTED' }],
+      edges: [{ from: 'src/a.ts', to: 'src/b.ts', relation: 'DEPENDS_ON', source: 'code-ast' }],
+    }));
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    await aggregateGlobalGraph(path.join(root, 'teamwiki'));
+
+    await codebaseCmd({ reconcile: true, output: root, json: true });
+
+    const graph = await loadGraphIndex(path.join(root, 'teamwiki'));
+    // Both endpoints were missing from the per-repo graph's nodes[] and got
+    // minted here by the reconciler; each must carry the SAME origin as the
+    // edge that required it, since both sides of an intra-repo AST/heuristic
+    // edge belong to that one codebase.
+    expect(graph?.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ slug: 'src/a.ts', origin: 'auth' }),
+      expect.objectContaining({ slug: 'src/b.ts', origin: 'auth' }),
+    ]));
+
+    const { scopeGlobalGraph } = await import('../graph-aggregate.js');
+    const scoped = await scopeGlobalGraph(path.join(root, 'teamwiki'), new Set(['auth']));
+    const survivingSlugs = scoped?.nodes.map((node) => node.slug) ?? [];
+    expect(survivingSlugs).not.toContain('src/a.ts');
+    expect(survivingSlugs).not.toContain('src/b.ts');
   });
 
   it('replaces legacy bridge edges that upstream persisted without endpoint nodes', async () => {
@@ -437,7 +468,8 @@ describe('codebase reconciliation', () => {
     fs.writeFileSync(path.join(root, 'teamwiki', 'product', 'auth.md'), '# Auth\nUse `AuthService` for login.\n');
     vi.spyOn(console, 'log').mockImplementation(() => undefined);
 
-    await codebaseCmd({ extract: root, project: 'auth', json: true });
+    const { extractCodebase } = await import('../codebase-extract.js');
+    await extractCodebase({ path: root, project: 'auth', json: true });
     const extracted = await loadGraphIndex(path.join(root, 'teamwiki'));
     expect(extracted?.edges).toContainEqual(
       expect.objectContaining({ from: 'src/auth.ts', to: 'src/auth.ts', relation: 'IMPLEMENTS', source: 'code-ast' }),

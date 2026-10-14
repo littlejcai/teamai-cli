@@ -1,6 +1,316 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { PassThrough } from 'node:stream';
 
-import { parseStdin } from '../hook-dispatch-cli.js';
+const { mockSpawn, mockDispatcher } = vi.hoisted(() => ({
+  mockSpawn: vi.fn(),
+  mockDispatcher: {
+    hasBackground: vi.fn(() => true),
+    dispatch: vi.fn(async () => ({ errors: [], output: null })),
+  },
+}));
+vi.mock('../hook-dispatch.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../hook-dispatch.js')>()),
+  createDispatcher: vi.fn(() => mockDispatcher),
+}));
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:child_process')>()),
+  spawn: mockSpawn,
+}));
+
+const { parseStdin, readStdin, trySpawnDetachedViaWmi, deriveDispatchSessionId, hookDispatchCli, claudeHookRunsInAnotherHost } =
+  await import('../hook-dispatch-cli.js');
+const { claudeHookOtherHostSkip } = await import('../claude-hook-host.js');
+const { reconcileHooks } = await import('../hooks.js');
+const { log } = await import('../utils/logger.js');
+
+describe('readStdin', () => {
+  it('closes a pipe after the EOF timeout so the hook process can exit', async () => {
+    const stdin = new PassThrough();
+    const pending = readStdin(stdin, 100);
+    stdin.write('{"session_id":"open-pipe"}');
+
+    await expect(pending).resolves.toBe('{"session_id":"open-pipe"}');
+    expect(stdin.destroyed).toBe(true);
+  });
+});
+
+describe('deriveDispatchSessionId', () => {
+  it('keeps a Copilot background fallback ID free of workspace paths', () => {
+    const cwd = path.join(os.tmpdir(), 'private-customer-project');
+    const originalClaudeSessionId = process.env.CLAUDE_SESSION_ID;
+    delete process.env.CLAUDE_SESSION_ID;
+    try {
+      const copilotId = deriveDispatchSessionId({ cwd }, 'copilot');
+      expect(copilotId).toMatch(/^pid-\d+$/);
+      expect(copilotId).not.toContain(cwd);
+
+      // Other providers retain the existing fallback used to distinguish projects.
+      expect(deriveDispatchSessionId({ cwd }, 'claude')).toContain(cwd);
+    } finally {
+      if (originalClaudeSessionId === undefined) delete process.env.CLAUDE_SESSION_ID;
+      else process.env.CLAUDE_SESSION_ID = originalClaudeSessionId;
+    }
+  });
+});
+
+describe('hookDispatchCli', () => {
+  it('records why a Git hook cannot sync an unreadable project config, without dispatching', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'git-hook-broken-config-'));
+    const previousCwd = process.cwd();
+    const persist = vi.spyOn(log, 'persist').mockImplementation(() => {});
+    try {
+      execFileSync('git', ['init', '-q'], { cwd: root });
+      fs.mkdirSync(path.join(root, '.teamai'));
+      fs.writeFileSync(path.join(root, '.teamai', 'config.yaml'), 'repo: [invalid');
+      process.chdir(root);
+      mockDispatcher.dispatch.mockClear();
+      await hookDispatchCli('post-merge', 'git', '*');
+      expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
+      expect(persist).toHaveBeenCalledWith(expect.stringMatching(/Nothing was synced:.*config.yaml/s));
+    } finally {
+      process.chdir(previousCwd);
+      fs.rmSync(root, { recursive: true, force: true });
+      persist.mockRestore();
+    }
+  });
+  it('skips claude hooks only when the other host has its own teamai hooks', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'host-hooks-'));
+    const home = path.join(root, 'home');
+    const project = path.join(root, 'project');
+    fs.mkdirSync(path.join(home, '.cursor'), { recursive: true });
+    fs.mkdirSync(path.join(project, '.cursor'), { recursive: true });
+    fs.mkdirSync(path.join(project, '.github', 'hooks'), { recursive: true });
+    const cursorHooks = path.join(home, '.cursor', 'hooks.json');
+    const projectCursorHooks = path.join(project, '.cursor', 'hooks.json');
+    const copilotHooks = path.join(project, '.github', 'hooks', 'teamai.json');
+    fs.writeFileSync(cursorHooks, '{"hooks":{"stop":[{"command":"teamai hook-dispatch stop --tool cursor"}]}}');
+    fs.writeFileSync(projectCursorHooks, '{"hooks":{"stop":[{"command":"teamai hook-dispatch stop --tool cursor"}]}}');
+    fs.writeFileSync(copilotHooks, '{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
+
+    const bare = path.join(root, 'bare-home');
+    fs.mkdirSync(bare);
+    expect(claudeHookRunsInAnotherHost('claude', { CURSOR_VERSION: '1.2.3', HOME: bare })).toBe(false);
+    expect(claudeHookRunsInAnotherHost('claude', { CURSOR_VERSION: '1.2.3', HOME: home })).toBe(true);
+    expect(claudeHookRunsInAnotherHost('claude', { CURSOR_VERSION: '1.2.3', HOME: bare, CURSOR_PROJECT_DIR: project })).toBe(true);
+    expect(claudeHookRunsInAnotherHost('claude', { COPILOT_PROJECT_DIR: project, COPILOT_CLI: '1' })).toBe(true);
+    // A claude session started from Copilot's bash tool: COPILOT_CLI only.
+    expect(claudeHookRunsInAnotherHost('claude', { COPILOT_CLI: '1', HOME: home })).toBe(false);
+    expect(claudeHookRunsInAnotherHost('claude', { COPILOT_PROJECT_DIR: project, HOME: home })).toBe(true);
+    fs.writeFileSync(copilotHooks, '{}');
+    expect(claudeHookRunsInAnotherHost('claude', { COPILOT_PROJECT_DIR: project })).toBe(false);
+    fs.writeFileSync(copilotHooks, '{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
+    expect(claudeHookRunsInAnotherHost('claude', {})).toBe(false);
+    expect(claudeHookRunsInAnotherHost('claude', { CURSOR_VERSION: '', COPILOT_PROJECT_DIR: '', HOME: home })).toBe(false);
+    expect(claudeHookRunsInAnotherHost('cursor', { CURSOR_VERSION: '1.2.3', HOME: home })).toBe(false);
+    expect(claudeHookRunsInAnotherHost('copilot', { COPILOT_PROJECT_DIR: project })).toBe(false);
+
+    const runPrefix = (extra: NodeJS.ProcessEnv, event?: string, matcher?: string): string => execFileSync(
+      'sh',
+      ['-c', `${claudeHookOtherHostSkip(event, matcher, 'echo RAN')}echo RAN`],
+      { env: { PATH: process.env.PATH ?? '', HOME: bare, ...extra }, encoding: 'utf8' },
+    );
+    expect(runPrefix({ CURSOR_VERSION: '1.2.3' }, 'Stop')).toBe('RAN\n');
+    expect(runPrefix({ CURSOR_VERSION: '1.2.3', HOME: home }, 'Stop')).toBe('');
+    expect(runPrefix({ CURSOR_VERSION: '1.2.3', CURSOR_PROJECT_DIR: project }, 'Stop')).toBe('');
+    // Copilot runs the team command itself only when the project's hook file delivers it.
+    expect(runPrefix({ COPILOT_PROJECT_DIR: project }, 'Stop')).toBe('RAN\n');
+    const builtinCopilotHooks = fs.readFileSync(copilotHooks, 'utf8');
+    // Only the same command for the same Copilot event and matcher replaces the Claude copy.
+    const rows: Array<[string | undefined, string | undefined, string, string]> = [
+      ['Stop', undefined, '{"Stop":[{"type":"command","bash":"echo RAN"}]}', ''],
+      ['Stop', '*', '{"Stop":[{"type":"command","command":"echo RAN"}]}', ''],
+      ['Stop', undefined, '{"SessionStart":[{"type":"command","bash":"echo RAN"}]}', 'RAN\n'],
+      ['Stop', undefined, '{"Stop":[{"type":"command","bash":"echo RAN","matcher":"Bash"}]}', 'RAN\n'],
+      ['PostToolUse', 'Bash', '{"PostToolUse":[{"type":"command","bash":"echo RAN","matcher":"Bash"}]}', ''],
+      ['PostToolUse', 'Bash', '{"PostToolUse":[{"type":"command","bash":"echo RAN","matcher":"Edit"}]}', 'RAN\n'],
+      ['PostToolUse', 'Bash', '{"PostToolUse":[{"type":"command","bash":"echo RAN"}]}', 'RAN\n'],
+      [undefined, undefined, '{"Stop":[{"type":"command","bash":"echo RAN"}]}', 'RAN\n'],
+    ];
+    for (const [event, matcher, hooks, output] of rows) {
+      fs.writeFileSync(copilotHooks, `{"version":1,"hooks":${hooks}}`);
+      expect(runPrefix({ COPILOT_PROJECT_DIR: project }, event, matcher), `${event} ${matcher} ${hooks}`).toBe(output);
+    }
+    fs.writeFileSync(copilotHooks, builtinCopilotHooks);
+    expect(runPrefix({ COPILOT_CLI: '1' }, 'Stop')).toBe('RAN\n');
+    expect(runPrefix({}, 'Stop')).toBe('RAN\n');
+
+    const previousCursor = process.env.CURSOR_VERSION;
+    const previousProjectDir = process.env.CURSOR_PROJECT_DIR;
+    const previousCopilotDir = process.env.COPILOT_PROJECT_DIR;
+    const previousCopilotCli = process.env.COPILOT_CLI;
+    const previousHome = process.env.HOME;
+    const stdinFile = path.join(os.tmpdir(), `host-hook-${process.pid}-${Date.now()}.json`);
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'Stop', session_id: 's', cwd: process.cwd() }));
+    const child = {
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) },
+      unref: vi.fn(),
+    };
+    mockDispatcher.dispatch.mockClear();
+    mockSpawn.mockClear();
+    mockSpawn.mockReturnValue(child);
+    delete process.env.COPILOT_CLI;
+    delete process.env.CURSOR_PROJECT_DIR;
+    try {
+      process.env.HOME = home;
+      process.env.CURSOR_VERSION = '1.2.3';
+      delete process.env.COPILOT_PROJECT_DIR;
+      await hookDispatchCli('stop', 'claude', '*');
+      expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
+
+      process.env.HOME = bare;
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
+
+      mockDispatcher.dispatch.mockClear();
+      delete process.env.CURSOR_VERSION;
+      process.env.COPILOT_PROJECT_DIR = project;
+      await hookDispatchCli('stop', 'claude', '*');
+      expect(mockDispatcher.dispatch).not.toHaveBeenCalled();
+
+      fs.writeFileSync(copilotHooks, '{}');
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
+
+      mockDispatcher.dispatch.mockClear();
+      delete process.env.COPILOT_PROJECT_DIR;
+      process.env.COPILOT_CLI = '1';
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
+
+      mockDispatcher.dispatch.mockClear();
+      fs.writeFileSync(copilotHooks, '{"version":1,"hooks":{"sessionStart":[{"type":"command","bash":"teamai hook-dispatch session-start --tool copilot"}]}}');
+      process.env.COPILOT_PROJECT_DIR = project;
+      await reconcileHooks(path.join(bare, '.copilot', 'hooks', 'teamai.json'), 'copilot');
+      await hookDispatchCli('stop', 'copilot', '*', { stdinFile });
+      expect(mockDispatcher.dispatch).toHaveBeenCalledTimes(1);
+    } finally {
+      fs.rmSync(stdinFile, { force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+      if (previousCursor === undefined) delete process.env.CURSOR_VERSION;
+      else process.env.CURSOR_VERSION = previousCursor;
+      if (previousProjectDir === undefined) delete process.env.CURSOR_PROJECT_DIR;
+      else process.env.CURSOR_PROJECT_DIR = previousProjectDir;
+      if (previousCopilotDir === undefined) delete process.env.COPILOT_PROJECT_DIR;
+      else process.env.COPILOT_PROJECT_DIR = previousCopilotDir;
+      if (previousCopilotCli === undefined) delete process.env.COPILOT_CLI;
+      else process.env.COPILOT_CLI = previousCopilotCli;
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
+  });
+
+  it('steps Claude aside only for a Copilot hook file Copilot loads and runs', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'host-hooks-active-'));
+    const project = path.join(root, 'project');
+    const copilotHome = path.join(root, 'copilot');
+    const projectFile = path.join(project, '.github', 'hooks', 'teamai.json');
+    const globalFile = path.join(copilotHome, 'hooks', 'teamai.json');
+    fs.mkdirSync(path.dirname(projectFile), { recursive: true });
+    fs.mkdirSync(path.dirname(globalFile), { recursive: true });
+    const file = (entry: object, extra: object = {}) => JSON.stringify({ version: 1, ...extra, hooks: { Stop: [entry] } });
+    const builtin = { type: 'command', bash: 'teamai hook-dispatch stop --tool copilot' };
+    const team = { type: 'command', bash: 'echo RAN' };
+    // [case, builtin file, team file, Copilot runs it]
+    const rows: Array<[string, string, string, boolean]> = [
+      ['active', file(builtin), file(team), true],
+      ['powershell only', file({ type: 'command', powershell: builtin.bash }), file({ type: 'command', powershell: 'echo RAN' }), true],
+      ['disableAllHooks', file(builtin, { disableAllHooks: true }), file(team, { disableAllHooks: true }), false],
+      ['malformed', `${file(builtin)},`, `${file(team)},`, false],
+      ['no version', JSON.stringify({ hooks: { Stop: [builtin] } }), JSON.stringify({ hooks: { Stop: [team] } }), false],
+      ['version 2', file(builtin, { version: 2 }), file(team, { version: 2 }), false],
+      ['entry not a command', file({ ...builtin, type: 'prompt' }), file({ ...team, type: 'prompt' }), false],
+    ];
+    const env = { COPILOT_PROJECT_DIR: project, COPILOT_HOME: copilotHome, HOME: root };
+    const guard = (): string => execFileSync('sh', ['-c', `${claudeHookOtherHostSkip('Stop', undefined, 'echo RAN')}echo RAN`],
+      { env: { PATH: process.env.PATH ?? '', ...env }, encoding: 'utf8' });
+    try {
+      for (const [name, builtinFile, teamFile, runs] of rows) {
+        fs.writeFileSync(projectFile, builtinFile);
+        expect(claudeHookRunsInAnotherHost('claude', env, false), `project, self mode: ${name}`).toBe(runs);
+        expect(claudeHookRunsInAnotherHost('claude', env, true), `project: ${name}`).toBe(runs);
+        fs.rmSync(projectFile);
+        fs.writeFileSync(globalFile, builtinFile);
+        expect(claudeHookRunsInAnotherHost('claude', env, true), `global: ${name}`).toBe(runs);
+        expect(claudeHookRunsInAnotherHost('claude', env, false), `global, self mode: ${name}`).toBe(false);
+        fs.rmSync(globalFile);
+        fs.writeFileSync(projectFile, teamFile);
+        expect(guard(), `team guard: ${name}`).toBe(runs ? '' : 'RAN\n');
+        fs.rmSync(projectFile);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('starts the background pass from the temp dir when the payload cwd no longer exists', async () => {
+    // spawn() fails on a missing cwd, and that error is swallowed: no background
+    // handler (session-start pull, webhook, update check) would run at all.
+    const stdinFile = path.join(os.tmpdir(), `gone-cwd-hook-${process.pid}-${Date.now()}.json`);
+    const gone = path.join(os.tmpdir(), `teamai-deleted-worktree-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(stdinFile, JSON.stringify({ hook_event_name: 'Stop', session_id: 's', cwd: gone }));
+    const originalCwd = process.cwd();
+    mockSpawn.mockClear();
+    mockSpawn.mockReturnValue({
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((_: string, done: () => void) => done()) },
+      unref: vi.fn(),
+    });
+
+    try {
+      await hookDispatchCli('stop', 'claude', '*', { stdinFile });
+      expect(mockSpawn).toHaveBeenCalledOnce();
+      // The same fallback the Windows WMI launch uses: a directory that exists
+      // and belongs to no project, so a handler still reading the process cwd
+      // (the session-start pull) cannot land in the launcher's project.
+      expect(mockSpawn.mock.calls[0][2]).toMatchObject({ cwd: os.tmpdir() });
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(stdinFile, { force: true });
+    }
+  });
+
+  it('passes a path-free fallback session ID to a Copilot detached handler', async () => {
+    const stdinFile = path.join(os.tmpdir(), `copilot-hook-${process.pid}-${Date.now()}.json`);
+    const cwd = process.cwd();
+    const previousClaudeId = process.env.CLAUDE_SESSION_ID;
+    delete process.env.CLAUDE_SESSION_ID;
+    fs.writeFileSync(stdinFile, JSON.stringify({
+      hook_event_name: 'SessionStart', cwd,
+    }));
+    let detachedPayload = '';
+    const child = {
+      on: vi.fn(),
+      stdin: { on: vi.fn(), end: vi.fn((raw: string, done: () => void) => {
+        detachedPayload = raw;
+        done();
+      }) },
+      unref: vi.fn(),
+    };
+    mockSpawn.mockReturnValue(child);
+
+    const previousCopilotHome = process.env.COPILOT_HOME;
+    process.env.COPILOT_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'copilot-home-'));
+    await reconcileHooks(path.join(process.env.COPILOT_HOME, 'hooks', 'teamai.json'), 'copilot');
+    try {
+      await hookDispatchCli('session-start', 'copilot', '*', { stdinFile });
+      expect(mockSpawn).toHaveBeenCalled();
+      expect(JSON.parse(detachedPayload).session_id).toMatch(/^pid-\d+$/);
+      expect(JSON.parse(detachedPayload).session_id).not.toContain(cwd);
+    } finally {
+      fs.rmSync(stdinFile, { force: true });
+      fs.rmSync(process.env.COPILOT_HOME, { recursive: true, force: true });
+      if (previousCopilotHome === undefined) delete process.env.COPILOT_HOME;
+      else process.env.COPILOT_HOME = previousCopilotHome;
+      if (previousClaudeId === undefined) delete process.env.CLAUDE_SESSION_ID;
+      else process.env.CLAUDE_SESSION_ID = previousClaudeId;
+    }
+  });
+});
 
 describe('parseStdin', () => {
   it('degrades malformed JSON to an empty object instead of null', () => {
@@ -11,6 +321,16 @@ describe('parseStdin', () => {
     expect(result).not.toBeNull();
     expect(result).toBeTypeOf('object');
     expect(result.hook_event_name).toBe('Stop');
+  });
+
+  it('never writes malformed hook body fragments to debug logs', () => {
+    const secret = 'ghp_sensitive_hook_fragment';
+    parseStdin(`{"prompt":"${secret}`, 'user-prompt-submit');
+
+    const debugOutput = vi.mocked(log.debug).mock.calls.flat().join('\n');
+    expect(debugOutput).toContain('failed to parse STDIN JSON');
+    expect(debugOutput).not.toContain(secret);
+    expect(debugOutput).not.toContain('body=');
   });
 
   it('returns an empty object (plus event name) for blank STDIN', () => {
@@ -27,6 +347,11 @@ describe('parseStdin', () => {
   it('maps lower-case event aliases to their canonical hook names', () => {
     const result = parseStdin('', 'session-start');
     expect(result.hook_event_name).toBe('SessionStart');
+  });
+
+  it('maps the Copilot lifecycle alias to SessionEnd', () => {
+    const result = parseStdin('', 'session-end');
+    expect(result.hook_event_name).toBe('SessionEnd');
   });
 
   it('degrades JSON `null` to {} instead of throwing', () => {
@@ -55,5 +380,149 @@ describe('parseStdin', () => {
     const result = parseStdin('[1,2]', 'stop');
     expect(Array.isArray(result)).toBe(false);
     expect(result).toEqual({ hook_event_name: 'Stop' });
+  });
+
+  it('salvages identity fields from a payload mangled at its multi-byte section', () => {
+    // Simulates the Windows VBS launcher's ANSI-codepage round trip: the UTF-8
+    // payload breaks at the first multi-byte sequence (quote swallowed, tail
+    // lost), but the ASCII head is intact. The degraded dispatch must still be
+    // linked to the right session and tool.
+    const mangled =
+      '{"cwd":"D:\\\\proj","hookEventName":"PostToolUse","sessionId":"sess_abc-123"' +
+      ',"toolName":"Bash","tool_response":{"content":"经验';
+    const result = parseStdin(mangled, 'post-tool-use');
+    expect(result.sessionId).toBe('sess_abc-123');
+    expect(result.toolName).toBe('Bash');
+    expect(result.cwd).toBe('D:\\proj');
+    expect(result.hook_event_name).toBe('PostToolUse');
+  });
+
+  it('skips salvage fields whose value itself was truncated mid-string', () => {
+    // The quote that closes transcript_path was swallowed by the codepage
+    // round trip, so no intact value exists — the field must be absent rather
+    // than garbage.
+    const mangled = '{"sessionId":"sess_ok","transcript_path":"C:\\\\logs\\u4e2d';
+    const result = parseStdin(mangled, 'stop');
+    expect(result.sessionId).toBe('sess_ok');
+    expect(result.transcript_path).toBeUndefined();
+    expect(result.hook_event_name).toBe('Stop');
+  });
+});
+/** A child that reports the given outcome once its listeners are attached. */
+function fakePowerShell(code: number | null, error?: Error, output = '') {
+  const handlers = new Map<string, ((...args: unknown[]) => void)[]>();
+  let scheduled = false;
+  const fire = (event: string, arg: unknown) => handlers.get(event)?.forEach((cb) => cb(arg));
+  const stream = {
+    on(event: string, cb: (chunk: Buffer) => void) {
+      if (event === 'data' && output) setTimeout(() => cb(Buffer.from(output)), 0);
+      return stream;
+    },
+  };
+  const child = {
+    stdout: stream,
+    stderr: stream,
+    on(event: string, cb: (...args: unknown[]) => void) {
+      handlers.set(event, [...(handlers.get(event) ?? []), cb]);
+      if (!scheduled) {
+        scheduled = true;
+        setTimeout(() => (error ? fire('error', error) : fire('close', code)), 5);
+      }
+      return child;
+    },
+  };
+  return child;
+}
+
+/** Pull the payload path the helper appended to the WMI command line. */
+function payloadFileOf(script: string): string | undefined {
+  return /--stdin-file ([^',\s]+)/.exec(script)?.[1];
+}
+
+beforeEach(() => {
+  mockSpawn.mockReset().mockReturnValue(fakePowerShell(0));
+  // keep the shared debug.log free of test noise
+  vi.spyOn(log, 'debug').mockImplementation(() => {});
+});
+
+/** Payload files this test created, so cleanup never touches anyone else's. */
+const createdPayloads: string[] = [];
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const f of createdPayloads.splice(0)) fs.rmSync(f, { force: true });
+});
+
+describe('trySpawnDetachedViaWmi', () => {
+  it('creates the child through Win32_Process, hidden, with the payload as a file', async () => {
+    await expect(trySpawnDetachedViaWmi(
+      'C:\\node\\node.exe',
+      ['C:\\cli\\index.js', 'hook-dispatch', '--matcher', 'a b'],
+      { cwd: process.cwd(), stdin: '{"session_id":"abc"}', platform: 'win32' },
+    )).resolves.toBe(true);
+
+    const [command, argv, options] = mockSpawn.mock.calls[0] as [string, string[], { windowsHide?: boolean }];
+    // absolute when the filesystem has one: the hook's PATH is the host's, not ours
+    expect(command).toMatch(/powershell\.exe$/);
+    expect(options.windowsHide).toBe(true);
+
+    const script = argv[argv.length - 1];
+    expect(script).toContain("[wmiclass]'Win32_Process'");
+    expect(script).toContain('ShowWindow = [uint16]0');
+    // the command line is one string, so args with spaces are quoted for CreateProcess…
+    expect(script).toContain('"a b"');
+    // …while the working directory is a plain (PowerShell-literal) path argument
+    expect(script).toContain(`'${process.cwd()}'`);
+
+    const file = payloadFileOf(script);
+    expect(file).toBeTruthy();
+    createdPayloads.push(file!);
+    expect(fs.readFileSync(file!, 'utf8')).toBe('{"session_id":"abc"}');
+  });
+
+  it('substitutes a working directory when the payload has none', async () => {
+    // An empty CurrentDirectory is ReturnValue 21 at the provider, and a
+    // session-start payload often carries no cwd at all.
+    await expect(trySpawnDetachedViaWmi('node', ['cli.js'], { platform: 'win32' })).resolves.toBe(true);
+
+    const script = (mockSpawn.mock.calls[0][1] as string[]).at(-1)!;
+    expect(script).toContain(`'${os.tmpdir()}'`);
+  });
+
+  it('reports failure and cleans up when the provider refuses (caller then falls back)', async () => {
+    // Exit 3 is the provider refusing the call, which is definitive: no second attempt.
+    mockSpawn.mockReturnValue(fakePowerShell(3, undefined, 'ReturnValue=21'));
+
+    await expect(trySpawnDetachedViaWmi('node', ['cli.js'], { platform: 'win32', stdin: '{}' })).resolves.toBe(false);
+
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    const script = (mockSpawn.mock.calls[0][1] as string[]).at(-1)!;
+    const file = payloadFileOf(script);
+    expect(file).toBeTruthy();
+    createdPayloads.push(file!);
+    expect(fs.existsSync(file!)).toBe(false);
+  });
+
+  it('retries with the cmdlet form when the script never reached the provider', async () => {
+    // No ReturnValue in the output = the accelerator itself was rejected, which
+    // is what a locked-down host looks like. The retry succeeds.
+    mockSpawn
+      .mockReturnValueOnce(fakePowerShell(1, undefined, "'[wmiclass]' is not recognized"))
+      .mockReturnValueOnce(fakePowerShell(0));
+
+    await expect(trySpawnDetachedViaWmi('node', ['cli.js'], { platform: 'win32' })).resolves.toBe(true);
+
+    expect(mockSpawn).toHaveBeenCalledTimes(2);
+    expect((mockSpawn.mock.calls[1][1] as string[]).at(-1)).toContain('Invoke-CimMethod');
+  });
+
+  it('reports failure when PowerShell itself cannot be started', async () => {
+    // The realistic shape of a missing binary: an 'error' event, not a throw.
+    // Fresh instance per attempt — each one reports its outcome exactly once.
+    mockSpawn.mockImplementation(() => fakePowerShell(null, new Error('spawn powershell.exe ENOENT')));
+
+    await expect(trySpawnDetachedViaWmi('node', ['cli.js'], { platform: 'win32' })).resolves.toBe(false);
+
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // both attempts tried
   });
 });

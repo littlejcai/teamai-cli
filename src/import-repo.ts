@@ -3,9 +3,9 @@ import fs from 'fs-extra';
 import chalk from 'chalk';
 
 import { generateCodebaseMd } from './codebase.js';
-import { extractCodebase } from './codebase-extract.js';
+import { importCodebase, publishTeamwikiViaMR, reconcileAndDeepEnrich, refreshTeamwikiIndexes } from './import-codebase.js';
 import { detectProvider, getProvider } from './providers/registry.js';
-import { shallowClone, shallowFetch } from './clone.js';
+import { remoteHeadSha, shallowClone, shallowFetch } from './clone.js';
 import {
     getRepoCacheDir,
     getRepoSlug,
@@ -16,6 +16,7 @@ import {
 import { touchCacheEntry } from './utils/cache-index.js';
 import { log } from './utils/logger.js';
 import { hasFrontmatter, stripFrontmatter } from './utils/frontmatter.js';
+import { lockTeamwiki, resolveTeamwiki } from './utils/teamwiki-root.js';
 
 // ─── Types ──────────────────────────────────────────────
 
@@ -30,23 +31,17 @@ export interface ImportFromRepoOptions {
     forceAnonymous?: boolean;
     /** Skip AI recommendation when --domain is explicitly set */
     explicitDomain?: string;
-    /** Dry-run mode: skip writing to disk but still execute clone+scan */
+    /** Dry-run mode: read the remote head with ls-remote and stop before the clone, the lock and the LLM scan */
     dryRun?: boolean;
-    /** Custom output root directory; defaults to .teamai/team-repo/teamwiki */
+    /** Write into <output>/teamwiki instead of the team repo's teamwiki/ (no push) */
     output?: string;
-    /**
-     * Whether to enable interactive confirmation.
-     * Default true (shows AI recommendation and waits for user input in TTY);
-     * pass false for batch imports → non-TTY path (assign to uncategorized when confidence is low).
-     */
-    interactive?: boolean;
     /** Incremental mode: on cache hit do fetch+reset only; on miss fall back to full clone */
     incremental?: boolean;
     /** In batch mode, skip per-repo autoPushTeamRepo (caller handles it collectively) */
     skipAutoPush?: boolean;
     /** Skip AI enrichment (only clone + extract + graph, no LLM calls) */
     skipEnrich?: boolean;
-    /** Source MR/PR URL to record as ingested (P5, passed through to extractCodebase). */
+    /** Source MR/PR URL to record as ingested in source-manifest.json (P5). */
     sourceMrUrl?: string;
 }
 
@@ -57,11 +52,17 @@ interface SimpleGraphNode {
     kind?: string; type?: string;
     label?: string; title?: string;
     file?: string;
+    origin?: string;
 }
 
 interface SimpleGraphIndex {
     nodes: SimpleGraphNode[];
-    edges: Array<{ from: string; to: string; relation: string }>;
+    edges: Array<{ from: string; to: string; relation: string; origin?: string }>;
+}
+
+interface LabelMatch {
+    id: string;
+    origin?: string;
 }
 
 /**
@@ -76,33 +77,50 @@ interface SimpleGraphIndex {
 export function detectCrossRepoEdges(
     overlay: SimpleGraphIndex,
     existing: SimpleGraphIndex,
-): Array<{ from: string; to: string; relation: 'DEPENDS_ON' }> {
-    const crossEdges: Array<{ from: string; to: string; relation: 'DEPENDS_ON' }> = [];
+): Array<{ from: string; to: string; relation: 'DEPENDS_ON'; crossOriginPairs?: string[][] }> {
+    const crossEdges: Array<{ from: string; to: string; relation: 'DEPENDS_ON'; crossOriginPairs?: string[][] }> = [];
     const edgeSet = new Set<string>();
 
     const nodeId = (n: SimpleGraphNode): string => n.id ?? n.slug ?? '';
     const nodeLabel = (n: SimpleGraphNode): string => n.label ?? n.title ?? '';
     const nodeKind = (n: SimpleGraphNode): string => n.kind ?? n.type ?? '';
+    // Both sides this edge spans matter: the side whose own import produced
+    // the match, AND the side that match resolved to. Either one being
+    // withheld later makes the relationship stale, so both are captured now
+    // as a single pair — a slug collision after this can still reattribute
+    // either endpoint node's CURRENT origin, but never this edge's own
+    // record of what it depended on at the moment it was detected. Wrapped
+    // in an outer array since `mergeGraphs` unions pairs from independent
+    // detections rather than letting one overwrite another (#974 review
+    // round 15 P2) — see `GraphEdge.crossOriginPairs`.
+    const crossOriginPair = (a?: string, b?: string): string[][] | undefined => {
+        const origins = [a, b].filter((o): o is string => !!o);
+        return origins.length > 0 ? [origins] : undefined;
+    };
 
-    // Build label index for the existing graph's components/interfaces
-    const existingIndex = new Map<string, string>();
+    // Build label index for the existing graph's components/interfaces. Each
+    // entry's `origin` is the matched node's AT THIS MOMENT — the only time
+    // it's unambiguous, since a later-aggregated repo can still mint a
+    // colliding unqualified slug and win the merge, silently reattributing
+    // the final node without updating an edge created from this match.
+    const existingIndex = new Map<string, LabelMatch>();
     for (const node of existing.nodes) {
         const label = nodeLabel(node);
-        if (label) existingIndex.set(label.toLowerCase(), nodeId(node));
+        if (label) existingIndex.set(label.toLowerCase(), { id: nodeId(node), origin: node.origin });
     }
 
     // Build label index for the new graph's components/interfaces
-    const overlayIndex = new Map<string, string>();
+    const overlayIndex = new Map<string, LabelMatch>();
     for (const node of overlay.nodes) {
         const label = nodeLabel(node);
-        if (label) overlayIndex.set(label.toLowerCase(), nodeId(node));
+        if (label) overlayIndex.set(label.toLowerCase(), { id: nodeId(node), origin: node.origin });
     }
 
     // Check if import edge targets in the new repo match component names in the existing repo
     for (const edge of overlay.edges) {
         if (edge.relation !== 'imports') continue;
         const segments = edge.to.split('/');
-        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java)$/, '') ?? '';
+        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java|swift|scala)$/, '') ?? '';
         const pascalName = fileName.split(/[-_]/).map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('');
 
         const match = existingIndex.get(pascalName.toLowerCase());
@@ -110,10 +128,16 @@ export function detectCrossRepoEdges(
             const fromNode = overlay.nodes.find(n => (n.file ?? n.id ?? n.slug ?? '') === edge.from);
             if (fromNode) {
                 const fromId = nodeId(fromNode);
-                const key = `${fromId}|${match}`;
+                const key = `${fromId}|${match.id}`;
                 if (!edgeSet.has(key)) {
                     edgeSet.add(key);
-                    crossEdges.push({ from: fromId, to: match, relation: 'DEPENDS_ON' });
+                    // The import edge's OWN origin tag, not a fresh lookup of
+                    // whichever node currently sits at `edge.from`'s slug: a
+                    // node collision that happens AFTER this edge was tagged
+                    // (in a later-processed repo) can silently swap that
+                    // node out without ever touching this edge's own tag
+                    // (#974 review round 14 P1).
+                    crossEdges.push({ from: fromId, to: match.id, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(edge.origin ?? fromNode.origin, match.origin) });
                 }
             }
         }
@@ -123,7 +147,7 @@ export function detectCrossRepoEdges(
     for (const edge of existing.edges) {
         if (edge.relation !== 'imports') continue;
         const segments = edge.to.split('/');
-        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java)$/, '') ?? '';
+        const fileName = segments[segments.length - 1]?.replace(/\.(ts|tsx|js|jsx|py|go|rs|java|swift|scala)$/, '') ?? '';
         const pascalName = fileName.split(/[-_]/).map(s => s.charAt(0).toUpperCase() + s.slice(1)).join('');
 
         const match = overlayIndex.get(pascalName.toLowerCase());
@@ -131,10 +155,17 @@ export function detectCrossRepoEdges(
             const fromNode = existing.nodes.find(n => (n.file ?? n.id ?? n.slug ?? '') === edge.from);
             if (fromNode) {
                 const fromId = nodeId(fromNode);
-                const key = `${fromId}|${match}`;
+                const key = `${fromId}|${match.id}`;
                 if (!edgeSet.has(key)) {
                     edgeSet.add(key);
-                    crossEdges.push({ from: fromId, to: match, relation: 'DEPENDS_ON' });
+                    // Same reasoning as the forward loop above: `existing`
+                    // accumulates every repo processed so far, so the node
+                    // currently at `edge.from`'s slug may already belong to
+                    // a DIFFERENT, later-colliding repo than the one whose
+                    // `imports` edge this actually is. `edge.origin` was
+                    // stamped once, at that edge's own tagging time, and is
+                    // immune to any node collision that happens afterward.
+                    crossEdges.push({ from: fromId, to: match.id, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(edge.origin ?? fromNode.origin, match.origin) });
                 }
             }
         }
@@ -150,10 +181,10 @@ export function detectCrossRepoEdges(
         const cfgId = nodeId(cfg);
         const match = existingIndex.get(cfgName);
         if (match) {
-            const key = `${match}|${cfgId}`;
+            const key = `${match.id}|${cfgId}`;
             if (!edgeSet.has(key)) {
                 edgeSet.add(key);
-                crossEdges.push({ from: match, to: cfgId, relation: 'DEPENDS_ON' });
+                crossEdges.push({ from: match.id, to: cfgId, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(match.origin, cfg.origin) });
             }
         }
     }
@@ -164,10 +195,10 @@ export function detectCrossRepoEdges(
         const cfgId = nodeId(cfg);
         const match = overlayIndex.get(cfgName);
         if (match) {
-            const key = `${match}|${cfgId}`;
+            const key = `${match.id}|${cfgId}`;
             if (!edgeSet.has(key)) {
                 edgeSet.add(key);
-                crossEdges.push({ from: match, to: cfgId, relation: 'DEPENDS_ON' });
+                crossEdges.push({ from: match.id, to: cfgId, relation: 'DEPENDS_ON', crossOriginPairs: crossOriginPair(match.origin, cfg.origin) });
             }
         }
     }
@@ -178,22 +209,40 @@ export function detectCrossRepoEdges(
 // ─── Public API ─────────────────────────────────────────
 
 /**
+ * The evidence slug of a remote repo, `<provider>__<owner>__<repo>`: what
+ * `--from-repo`, `--from-mr` and `teamai ci extract-mr` all name
+ * `teamwiki/evidence/code/<slug>/`, so they update the same codebase.
+ *
+ * @throws Error when the URL names no supported provider
+ */
+export function repoSlugForUrl(url: string): string {
+    const providerName = detectProvider(url);
+    if (!providerName) throw new Error(`Unsupported repo URL: ${url}`);
+    const { owner, repo } = getProvider(providerName).parseRepoInput(url);
+    return getRepoSlug(providerName, owner, repo);
+}
+
+/**
  * Main entry point for `teamai import --from-repo <url>`.
  *
  * Flow:
  *  1. Parse url → provider + RepoInfo (owner/repo)
  *  2. Shallow clone (or incremental fetch+reset) to ~/.teamai/cache/repos/<provider>/<owner>/<repo>
  *  3. generateCodebaseMd({ repoPath: cacheDir }) → AI narrative
- *  4. extractCodebase → teamwiki evidence artifacts (deterministic overview + graph)
+ *  4. importCodebase → teamwiki/evidence/code/<slug>/ (deterministic overview + graph),
+ *     in <output>/teamwiki or the team repo's teamwiki/
  *  5. Append AI narrative to teamwiki/evidence/code/<slug>/overview.md
  *  6. Write LAST_SYNC
+ *
+ * A dry run stops after step 1: it reads the target remote commit with `git ls-remote`
+ * and reports whether the cache is current.
  *
  * @throws Error on clone failure, scan failure, or IO failure
  */
 export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void> {
     const {
         url, depth = 1, forceSsh = false, forceAnonymous = false,
-        explicitDomain, dryRun = false, output, interactive = true,
+        explicitDomain, dryRun = false, output,
         incremental = false, skipAutoPush = false, skipEnrich = false, sourceMrUrl,
     } = opts;
 
@@ -210,13 +259,56 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
     log.info(`Importing remote repo: ${owner}/${repoName} (provider: ${providerName})`);
 
     // 2. Shallow clone or incremental fetch+reset
-    await ensureCacheRoot();
     const cacheDir = getRepoCacheDir(providerName, owner, repoName);
     const slug = getRepoSlug(providerName, owner, repoName);
 
     const lastSync = await readLastSync(cacheDir);
     const cacheExists = await fs.pathExists(path.join(cacheDir, '.git'));
     const useIncremental = incremental && cacheExists && lastSync !== null;
+
+    // Where the evidence goes: <output>/teamwiki, else the team repo's teamwiki/.
+    // Resolved before the clone so a missing team repo fails fast; a preview
+    // without one still reports what it can.
+    const target = await resolveTeamwiki({ output, dryRun }).catch((error: unknown) => {
+        if (!dryRun) throw error;
+        return undefined;
+    });
+    const evidenceDest = target ? path.join(target.wikiRoot, 'evidence', 'code', slug) : undefined;
+    // LAST_SYNC belongs to the shared clone cache: an unchanged cache is skipped
+    // only when this teamwiki already holds that commit, not when another
+    // --output or team repo was imported at it.
+    const publishedHead = async (): Promise<string | undefined> => evidenceDest
+        ? ((await fs.readJson(path.join(evidenceDest, 'source-manifest.json')).catch(() => null)) as { headSha?: string } | null)?.headSha
+        : undefined;
+
+    // A preview asks for the target remote commit and stops: the clone replaces the
+    // cache (or fetches and resets it), and the lock and LLM scan follow (#900).
+    if (dryRun) {
+        let head: string;
+        let previewIncremental = useIncremental;
+        try {
+            head = await remoteHeadSha(url, providerName, {
+                forceSsh, forceAnonymous, cachedRepoPath: useIncremental ? cacheDir : undefined,
+            });
+        } catch (error) {
+            if (!useIncremental) throw error;
+            log.warn(`[incremental] preview refresh failed, previewing a full clone instead: ${(error as Error).message}`);
+            head = await remoteHeadSha(url, providerName, { forceSsh, forceAnonymous });
+            previewIncremental = false;
+        }
+        const skips = previewIncremental && (await publishedHead()) === head;
+        const cache = !cacheExists
+            ? `not cached yet, a real run would clone it into ${cacheDir}`
+            : lastSync?.sha === head
+                ? `cache is current at ${head.slice(0, 8)}${skips ? ', so an incremental run would skip it' : ''}`
+                : `cache would be refreshed from ${lastSync ? lastSync.sha.slice(0, 8) : 'an unrecorded commit'} to ${head.slice(0, 8)}`;
+        log.info(`[dry-run] Would import ${owner}/${repoName} at ${head.slice(0, 8)} into ${evidenceDest ?? path.join('teamwiki', 'evidence', 'code', slug)}; ${cache}`);
+        return;
+    }
+    if (!target || !evidenceDest) throw new Error('unreachable: the teamwiki resolves outside a dry run');
+    const { wikiRoot: teamwikiRoot, team } = target;
+
+    await ensureCacheRoot();
 
     let cloneSha: string;
     let cloneBranch: string;
@@ -262,8 +354,9 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
 
     log.info(`Clone/Fetch complete: SHA=${cloneSha.slice(0, 8)}, branch=${cloneBranch}`);
 
-    // 2.5 Skip AI scan if SHA unchanged (incremental fast path)
-    if (useIncremental && oldSha && cloneSha === oldSha) {
+    // 2.5 Skip the AI scan if the cache did not move and the target teamwiki
+    // already holds this commit (incremental fast path).
+    if (useIncremental && oldSha && cloneSha === oldSha && (await publishedHead()) === cloneSha) {
         log.info(`[incremental] SHA unchanged (${cloneSha.slice(0, 8)}), skipping AI scan`);
         await writeLastSync(cacheDir, cloneSha);
         try {
@@ -286,205 +379,74 @@ export async function importFromRepo(opts: ImportFromRepoOptions): Promise<void>
         }
     }
 
-    // Resolve team-repo directory (needed for teamwiki evidence output)
-    let teamRepoDir: string;
-    let teamRepoRemote = '';
-    let mrTeamConfig: { repo: string; provider?: string; reviewers?: string[] } | null = null;
-    let mrLocalConfig: { repo: { remote: string; localPath: string }; username: string } | null = null;
+    const releaseImportLock = await lockTeamwiki(target);
     try {
-        const { autoDetectInit } = await import('./config.js');
-        const { localConfig: lc, teamConfig: tc } = await autoDetectInit();
-        teamRepoDir = lc.repo.localPath;
-        teamRepoRemote = lc.repo.remote;
-        mrTeamConfig = { repo: tc.repo, provider: tc.provider, reviewers: tc.reviewers };
-        mrLocalConfig = { repo: lc.repo, username: lc.username };
-    } catch {
-        teamRepoDir = path.join(process.cwd(), '.teamai', 'team-repo');
-    }
-
-    const { acquireImportLock } = await import('./utils/import-lock.js');
-    const releaseImportLock = await acquireImportLock(teamRepoDir);
+    // 4. Extract into teamwiki/evidence/code/<slug>/ + append AI narrative to overview.md
+    let updated: boolean;
     try {
-    // 4. Generate teamwiki/ knowledge graph artifacts + append AI narrative to overview.md
-    const teamwikiRoot = output
-        ? path.resolve(output, '..', 'teamwiki')
-        : path.join(teamRepoDir, 'teamwiki');
-    if (!dryRun) {
-        const cacheWiki = path.join(cacheDir, 'teamwiki');
-        try {
-            // Incremental mode: copy existing cache files to cacheDir for extractCodebase to read
-            if (incremental) {
-                const destIndices = path.join(teamwikiRoot, '.indices');
-                const cacheIndices = path.join(cacheDir, 'teamwiki', '.indices');
-                await fs.ensureDir(cacheIndices);
-                for (const f of ['facts-cache.json', 'interfaces-cache.json']) {
-                    const src = path.join(destIndices, f);
-                    if (await fs.pathExists(src)) {
-                        await fs.copy(src, path.join(cacheIndices, f));
-                    }
-                }
-                const existingManifest = path.join(teamwikiRoot, 'source-manifest.json');
-                if (await fs.pathExists(existingManifest)) {
-                    await fs.copy(existingManifest, path.join(cacheDir, 'teamwiki', 'source-manifest.json'));
-                }
-            }
-            await extractCodebase({
-                path: cacheDir, project: slug, json: false, skipEnrich, incremental,
-                repoUrl: url,
-                branch: cloneBranch === 'HEAD' ? undefined : cloneBranch,
-                sourceMrUrl,
-            });
-            // Move artifacts from cacheDir/teamwiki/ to target teamwikiRoot
-            if (await fs.pathExists(cacheWiki)) {
-                const evidenceSrc = path.join(cacheWiki, 'evidence', 'code', slug);
-                const evidenceDest = path.join(teamwikiRoot, 'evidence', 'code', slug);
-                // Clear old evidence first (keep .indices/ subdir) to remove stale pages
-                if (await fs.pathExists(evidenceDest)) {
-                    const entries = await fs.readdir(evidenceDest);
-                    for (const entry of entries) {
-                        if (entry === '.indices') continue;
-                        await fs.remove(path.join(evidenceDest, entry));
-                    }
-                }
-                await fs.ensureDir(evidenceDest);
-                await fs.copy(evidenceSrc, evidenceDest, { overwrite: true });
-                // Write AI narrative to overview.md (idempotent: replace if exists, append if not)
-                if (codebaseMd) {
-                    const overviewPath = path.join(evidenceDest, 'overview.md');
-                    const existing = await fs.readFile(overviewPath, 'utf8').catch(() => '');
-                    const aiNarrative = stripFrontmatter(codebaseMd);
-                    const marker = '## AI Architecture Narrative';
-                    const oldMarker = '## AI 架构叙事';
-                    let markerIdx = existing.indexOf(marker);
-                    if (markerIdx < 0) markerIdx = existing.indexOf(oldMarker);
-                    const base = markerIdx >= 0 ? existing.slice(0, markerIdx).trimEnd() : existing.trimEnd();
-                    let combined: string;
-                    if (!base || !hasFrontmatter(base)) {
-                        combined = `---\ntitle: ${slug} overview\ndomain: code-knowledge\n---\n\n${marker}\n\n${aiNarrative}`;
-                    } else {
-                        combined = base + '\n\n---\n\n' + marker + '\n\n' + aiNarrative;
-                    }
-                    await fs.writeFile(overviewPath, combined, 'utf8');
-                }
-                // Per-repo graph: copy to evidence/<slug>/.indices/ (no global merge here — done in batch)
-                const srcGraph = path.join(cacheWiki, '.indices', 'graph-index.json');
-                if (await fs.pathExists(srcGraph)) {
-                    const evidenceGraphDir = path.join(teamwikiRoot, 'evidence', 'code', slug, '.indices');
-                    await fs.ensureDir(evidenceGraphDir);
-                    await fs.copy(srcGraph, path.join(evidenceGraphDir, 'graph-index.json'));
-                } else {
-                    log.debug(`[graph] per-repo graph-index.json not found, skipping copy`);
-                }
-                // Persist incremental cache files to teamwikiRoot (for future incremental use)
-                const cacheIndices = path.join(cacheWiki, '.indices');
-                const destIndices = path.join(teamwikiRoot, '.indices');
-                for (const cacheFile of ['facts-cache.json', 'interfaces-cache.json']) {
-                    const src = path.join(cacheIndices, cacheFile);
-                    if (await fs.pathExists(src)) {
-                        await fs.ensureDir(destIndices);
-                        await fs.copy(src, path.join(destIndices, cacheFile), { overwrite: true });
-                    }
-                }
-                const srcManifest = path.join(cacheWiki, 'source-manifest.json');
-                if (await fs.pathExists(srcManifest)) {
-                    await fs.copy(srcManifest, path.join(teamwikiRoot, 'source-manifest.json'), { overwrite: true });
-                }
-                await fs.remove(cacheWiki);
-            }
-            // Explicit --domain overrides AI inference
-            if (explicitDomain) {
-                const domainsJsonPath = path.join(teamwikiRoot, 'evidence', 'code', slug, '_domains.json');
-                if (await fs.pathExists(domainsJsonPath)) {
-                    try {
-                        const existing = JSON.parse(await fs.readFile(domainsJsonPath, 'utf8'));
-                        existing.domain = explicitDomain;
-                        await fs.writeFile(domainsJsonPath, JSON.stringify(existing, null, 2), 'utf8');
-                    } catch { /* skip */ }
-                } else {
-                    await fs.writeFile(domainsJsonPath, JSON.stringify({ domain: explicitDomain }, null, 2), 'utf8');
-                }
-            }
-            log.info(chalk.green(`✓ teamwiki/ knowledge graph updated: ${slug}`));
-        } catch (err) {
-            log.debug(`[wiki-engine] Graph generation failed (non-blocking): ${err instanceof Error ? err.message : err}`);
-        } finally {
-            await fs.remove(cacheWiki).catch(() => {});
-        }
-    }
-
-    // 4c. Reconcile product docs ↔ code knowledge (if product docs exist)
-    if (!dryRun && teamwikiRoot) {
-        try {
-            const { reconcileKnowledge } = await import('./wiki-engine/adapters/index.js');
-            const result = await reconcileKnowledge({ wikiRoot: teamwikiRoot, dryRun: false });
-            if (result.mappings > 0 || result.gaps.length > 0) {
-                log.info(`  reconcile: ${result.mappings} mappings, ${result.gaps.length} gaps, ${result.graphEdges.length} MAPS_TO edges`);
-            }
-        } catch (e) {
-            log.debug(`reconcile skipped: ${(e as Error).message}`);
-        }
-    }
-
-    // 5. Deep enrich (synchronous, before push — so all content goes into one MR)
-    if (!dryRun && !skipEnrich && teamwikiRoot) {
-        const evidenceDir = path.join(teamwikiRoot, 'evidence', 'code', slug);
-        if (await fs.pathExists(path.join(evidenceDir, '_manifest.json'))) {
-            try {
-                const { deepEnrich } = await import('./deep-enrich.js');
-                await deepEnrich({ project: slug, evidenceDir, wikiRoot: teamwikiRoot, cacheDir });
-                log.info(chalk.green(`✓ Deep enrich complete: ${slug}`));
-            } catch (e) {
-                log.debug(`deep-enrich failed for ${slug} (non-blocking): ${(e as Error).message}`);
-            }
-        }
-    }
-
-    // 6. Aggregate global graph + create MR (single-repo mode; batch mode handled by import-repo-list)
-    if (!dryRun && !skipAutoPush) {
-        if (teamwikiRoot) {
-            try {
-                const { aggregateGlobalGraph } = await import('./graph-aggregate.js');
-                await aggregateGlobalGraph(teamwikiRoot);
-            } catch (e) {
-                log.debug(`[graph] Single-repo aggregation skipped: ${(e as Error).message}`);
-            }
-            // Rebuild global router.md / index.md from the full evidence/code set
-            try {
-                const { rebuildWikiIndex } = await import('./rebuild-wiki-index.js');
-                await rebuildWikiIndex(teamwikiRoot);
-            } catch (e) {
-                const msg = e instanceof Error ? e.message : String(e);
-                log.warn(`[wiki] global index rebuild failed (non-blocking): ${msg}`);
-            }
-        }
-        if (await fs.pathExists(teamRepoDir) && mrTeamConfig && mrLocalConfig) {
-            const { autoPushViaMR } = await import('./utils/git.js');
-            const prUrl = await autoPushViaMR(
-                teamRepoDir,
-                `[teamai] Import codebase knowledge from ${owner}/${repoName}`,
-                ['.'],
-                mrTeamConfig,
-                mrLocalConfig,
-            );
-            if (prUrl) {
-                log.success(`MR created: ${prUrl}`);
+        updated = await importCodebase({
+            sourceDir: cacheDir, slug, wikiRoot: teamwikiRoot, incremental, skipEnrich,
+            repoUrl: url,
+            branch: cloneBranch === 'HEAD' ? undefined : cloneBranch,
+            sourceMrUrl,
+        });
+        // Write AI narrative to overview.md (idempotent: replace if exists, append if not)
+        if (updated && codebaseMd) {
+            const overviewPath = path.join(evidenceDest, 'overview.md');
+            const existing = await fs.readFile(overviewPath, 'utf8').catch(() => '');
+            const aiNarrative = stripFrontmatter(codebaseMd);
+            const marker = '## AI Architecture Narrative';
+            const oldMarker = '## AI 架构叙事';
+            let markerIdx = existing.indexOf(marker);
+            if (markerIdx < 0) markerIdx = existing.indexOf(oldMarker);
+            const base = markerIdx >= 0 ? existing.slice(0, markerIdx).trimEnd() : existing.trimEnd();
+            let combined: string;
+            if (!base || !hasFrontmatter(base)) {
+                combined = `---\ntitle: ${slug} overview\ndomain: code-knowledge\n---\n\n${marker}\n\n${aiNarrative}`;
             } else {
-                log.success(`Branch pushed to team knowledge repo${teamRepoRemote ? ` (${teamRepoRemote})` : ''}`);
+                combined = base + '\n\n---\n\n' + marker + '\n\n' + aiNarrative;
             }
+            await fs.writeFile(overviewPath, combined, 'utf8');
+        }
+        // Explicit --domain overrides AI inference
+        if (updated && explicitDomain) {
+            const domainsJsonPath = path.join(evidenceDest, '_domains.json');
+            if (await fs.pathExists(domainsJsonPath)) {
+                try {
+                    const existing = JSON.parse(await fs.readFile(domainsJsonPath, 'utf8'));
+                    existing.domain = explicitDomain;
+                    await fs.writeFile(domainsJsonPath, JSON.stringify(existing, null, 2), 'utf8');
+                } catch { /* skip */ }
+            } else {
+                await fs.writeFile(domainsJsonPath, JSON.stringify({ domain: explicitDomain }, null, 2), 'utf8');
+            }
+        }
+        log.info(chalk.green(updated
+            ? `✓ teamwiki/ knowledge graph updated: ${slug}`
+            : `✓ ${slug}: no source changes since the last import, teamwiki unchanged`));
+    } catch (err) {
+        throw new Error(`Knowledge extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (updated) {
+        // 5. Reconcile + deep enrich (synchronous, before push — so all content goes into one MR)
+        await reconcileAndDeepEnrich({ slug, wikiRoot: teamwikiRoot, sourceDir: cacheDir, skipEnrich });
+
+        // 6. Aggregate global graph + create MR (single-repo mode; batch mode handled by import-repo-list)
+        if (!skipAutoPush) {
+            await refreshTeamwikiIndexes(teamwikiRoot);
+            if (team) await publishTeamwikiViaMR(team, `[teamai] Import codebase knowledge from ${owner}/${repoName}`);
         }
     }
 
     log.info(chalk.green(`✓ Repo ${owner}/${repoName} import complete`));
 
-
     // 7. Write LAST_SYNC
-    if (!dryRun) {
-        await writeLastSync(cacheDir, cloneSha);
-        try {
-            await touchCacheEntry({ provider: providerName, owner, repo: repoName, lastSyncedSha: cloneSha });
-        } catch (touchErr) {
-            log.debug(`[cache-index] touchCacheEntry failed: ${String(touchErr)}`);
-        }
+    await writeLastSync(cacheDir, cloneSha);
+    try {
+        await touchCacheEntry({ provider: providerName, owner, repo: repoName, lastSyncedSha: cloneSha });
+    } catch (touchErr) {
+        log.debug(`[cache-index] touchCacheEntry failed: ${String(touchErr)}`);
     }
     } finally {
         await releaseImportLock();

@@ -2,7 +2,8 @@
 import path from 'node:path';
 
 import matter from 'gray-matter';
-import { readFileSafe, writeFile, listFiles, ensureDir, copyFile } from '../utils/fs.js';
+import { readFileSafe, writeFile, listFiles, ensureDir } from '../utils/fs.js';
+import { isInWriteRoot, listLearningFiles } from '../utils/learnings-roots.js';
 import { log } from '../utils/logger.js';
 import { computeAllConfidence } from './confidence.js';
 
@@ -31,18 +32,17 @@ const MIN_AGE_DAYS = 14;
  * Find learnings eligible for promotion to formal knowledge.
  */
 export async function findPromotionCandidates(
-  learningsDir: string,
+  learningsDirs: readonly string[],
   votesDir: string,
 ): Promise<PromotionCandidate[]> {
   const confidenceMap = await computeAllConfidence(votesDir);
   const candidates: PromotionCandidate[] = [];
 
   const perDoc = await aggregatePerDocVotes(votesDir);
-  const files = await listFiles(learningsDir);
+  const files = await listLearningFiles(learningsDirs);
   const now = Date.now();
 
-  for (const file of files) {
-    if (!file.endsWith('.md')) continue;
+  for (const { file, absPath } of files) {
     const docId = file.replace(/\.md$/i, '');
     const confidence = confidenceMap.get(docId) ?? 0;
     if (confidence < MIN_CONFIDENCE) continue;
@@ -52,7 +52,6 @@ export async function findPromotionCandidates(
     if (docVotes.upvoted < MIN_UPVOTED) continue;
     if (docVotes.users.size < MIN_USERS) continue;
 
-    const absPath = path.join(learningsDir, file);
     const content = await readFileSafe(absPath);
     if (!content) continue;
 
@@ -149,40 +148,50 @@ Output ONLY the transformed markdown content (including YAML frontmatter with ti
   }
 }
 
+/**
+ * The promoted entry's path, and the learning file it marked as promoted (null
+ * when it marked none), which is what a publish may stage (#823).
+ */
 export async function executePromotion(
   candidate: PromotionCandidate,
   repoPath: string,
-  options: PromoteOptions = {},
-): Promise<string> {
+  options: PromoteOptions & { learningsWriteDir?: string } = {},
+): Promise<{ targetPath: string; marked: string | null }> {
   const category = options.category ?? candidate.suggestedCategory;
   const targetDir = path.join(repoPath, category);
-  await ensureDir(targetDir);
-
   const targetPath = path.join(targetDir, candidate.filename);
 
   if (options.dryRun) {
     log.info(`[dry-run] Would promote ${candidate.docId} -> ${category}/${candidate.filename}`);
-    return targetPath;
+    return { targetPath, marked: null };
   }
 
   const originalContent = await readFileSafe(candidate.path);
   if (!originalContent) {
     log.error(`Cannot read source file: ${candidate.path}`);
-    return targetPath;
+    return { targetPath, marked: null };
   }
 
   // AI transforms the learning into a generalized format for the target category
   const promotedContent = await generatePromotedContent(originalContent, category, candidate.title);
   await writeFile(targetPath, promotedContent);
 
-  // Mark original learning as promoted
+  // Mark the learning as promoted. When it lives in a root nothing pushes, the
+  // mark goes to the write root instead: written in place it would be discarded
+  // by the next realign, and the same learning would be promoted again on the
+  // next run, paying for another model call.
   const { data, content: body } = matter(originalContent);
   data.promoted_to = `${category}/${candidate.filename}`;
   const updated = matter.stringify(body, data);
-  await writeFile(candidate.path, updated);
+  const markPath = options.learningsWriteDir
+    && !isInWriteRoot(candidate.path, options.learningsWriteDir)
+    ? path.join(options.learningsWriteDir, candidate.filename)
+    : candidate.path;
+  await ensureDir(path.dirname(markPath));
+  await writeFile(markPath, updated);
 
   log.success(`Promoted: ${candidate.docId} -> ${category}/${candidate.filename}`);
-  return targetPath;
+  return { targetPath, marked: markPath };
 }
 
 function inferCategoryByKeywords(content: string, title: string): 'skills' | 'rules' | 'docs' {
@@ -239,7 +248,7 @@ async function aggregatePerDocVotes(
   votesDir: string,
 ): Promise<Map<string, { recalled: number; upvoted: number; users: Set<string> }>> {
   const perDoc = new Map<string, { recalled: number; upvoted: number; users: Set<string> }>();
-  const { loadUserVotes } = await import('../votes.js');
+  const { readUserVotes } = await import('../votes.js');
   const voteFiles = await listFiles(votesDir);
 
   for (const file of voteFiles) {
@@ -248,7 +257,7 @@ async function aggregatePerDocVotes(
     const filePath = path.join(votesDir, file);
 
     try {
-      const data = await loadUserVotes(filePath);
+      const data = await readUserVotes(filePath);
       for (const [docId, entry] of Object.entries(data.votes)) {
         const existing = perDoc.get(docId) ?? { recalled: 0, upvoted: 0, users: new Set<string>() };
         existing.recalled += entry.recalled_count ?? 0;

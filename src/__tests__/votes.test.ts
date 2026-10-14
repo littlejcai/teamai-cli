@@ -8,6 +8,7 @@ import YAML from 'yaml';
 import {
   migrateV1ToV2,
   loadUserVotes,
+  readUserVotes,
   saveUserVotes,
   incrementRecalled,
   incrementUpvoted,
@@ -15,6 +16,11 @@ import {
   syncVotesToTeam,
   recallFeedback,
   hasPendingVoteDeltas,
+  pruneUpvoteLedger,
+  creditedDocIdsForSession,
+  readUserVotesFromContent,
+  stageVotesMerge,
+  confirmVotesSynced,
 } from '../votes.js';
 import type { UserVotes, UserVotesV2 } from '../types.js';
 
@@ -99,6 +105,43 @@ describe('loadUserVotes', () => {
   });
 });
 
+describe('readUserVotes', () => {
+  it('migrates a v1 file in memory and leaves it untouched on disk', async () => {
+    const v1: UserVotes = { votes: { 'doc-x': { at: '2026-06-01T00:00:00Z' } } };
+    const filePath = path.join(tmpDir, 'user.yaml');
+    fs.writeFileSync(filePath, YAML.stringify(v1));
+    const before = fs.readFileSync(filePath, 'utf-8');
+
+    const result = await readUserVotes(filePath);
+    expect(result.version).toBe(2);
+    expect(result.votes['doc-x'].recalled_count).toBe(1);
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(before);
+  });
+
+  it('reads a v2 file the same way loadUserVotes does', async () => {
+    const v2: UserVotesV2 = {
+      version: 2,
+      votes: { 'doc-y': { recalled_count: 3, upvoted_count: 1, last_recalled_at: '2026-06-01T00:00:00Z' } },
+      deltas: { 'doc-y': { recalled_delta: 1, upvoted_delta: 0 } },
+    };
+    const filePath = path.join(tmpDir, 'user.yaml');
+    fs.writeFileSync(filePath, YAML.stringify(v2));
+
+    expect(await readUserVotes(filePath)).toEqual(await loadUserVotes(filePath));
+  });
+
+  it('returns empty v2 for a missing or corrupt file, creating nothing', async () => {
+    const missing = path.join(tmpDir, 'nonexistent.yaml');
+    expect((await readUserVotes(missing)).version).toBe(2);
+    expect(fs.existsSync(missing)).toBe(false);
+
+    const corrupt = path.join(tmpDir, 'corrupt.yaml');
+    fs.writeFileSync(corrupt, '{{{{ not yaml }}}}');
+    expect(Object.keys((await readUserVotes(corrupt)).votes)).toHaveLength(0);
+    expect(fs.readFileSync(corrupt, 'utf-8')).toBe('{{{{ not yaml }}}}');
+  });
+});
+
 describe('hasPendingVoteDeltas', () => {
   it('is false when there is no votes file', async () => {
     expect(await hasPendingVoteDeltas(tmpDir, 'alice')).toBe(false);
@@ -119,6 +162,28 @@ describe('hasPendingVoteDeltas', () => {
       deltas: {},
     });
     expect(await hasPendingVoteDeltas(tmpDir, 'alice')).toBe(false);
+  });
+
+  // It runs from the Stop hook and team push without the votes lock, so a
+  // migration write here could overwrite a vote a locked writer just saved (#972).
+  it('reads a v1 file without rewriting it', async () => {
+    const filePath = path.join(tmpDir, 'alice.yaml');
+    const v1 = YAML.stringify({ votes: { 'doc-a': { at: '2026-06-01T00:00:00Z' } } } satisfies UserVotes);
+    fs.writeFileSync(filePath, v1);
+
+    expect(await hasPendingVoteDeltas(tmpDir, 'alice')).toBe(false);
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(v1);
+  });
+
+  // Control: the locked writers still persist the upgrade.
+  it('control: a locked writer still upgrades the v1 file it touches', async () => {
+    const filePath = path.join(tmpDir, 'alice.yaml');
+    fs.writeFileSync(filePath, YAML.stringify({ votes: { 'doc-a': { at: '2026-06-01T00:00:00Z' } } } satisfies UserVotes));
+
+    await incrementRecalled(filePath, ['doc-b']);
+
+    expect(YAML.parse(fs.readFileSync(filePath, 'utf-8')).version).toBe(2);
+    expect(await hasPendingVoteDeltas(tmpDir, 'alice')).toBe(true);
   });
 });
 
@@ -163,6 +228,163 @@ describe('incrementUpvoted', () => {
     expect(data.votes['doc-a'].upvoted_count).toBe(1);
     expect(data.votes['doc-a'].last_upvoted_at).toBeTruthy();
     expect(data.deltas['doc-a'].upvoted_delta).toBe(1);
+  });
+
+  it('does not lose increments under concurrent writers (lock)', async () => {
+    // Simulates the foreground votesSyncHandler and the detached judge handler
+    // incrementing the same votes file at the same time (issue #723).
+    const filePath = path.join(tmpDir, 'user.yaml');
+    await Promise.all(
+      Array.from({ length: 10 }, () => incrementUpvoted(filePath, ['doc-a'])),
+    );
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as UserVotesV2;
+    expect(data.votes['doc-a'].upvoted_count).toBe(10);
+    expect(data.deltas['doc-a'].upvoted_delta).toBe(10);
+  });
+
+  it('returns the credited docs, or [] when nothing new', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    expect(await incrementUpvoted(filePath, ['doc-a', 'doc-b'])).toEqual(['doc-a', 'doc-b']);
+  });
+
+  // ── per-session ledger dedup (atomic, in the votes file under the lock) ──
+
+  it('with a sessionId, credits a doc at most once per session', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    // First Stop credits both.
+    expect((await incrementUpvoted(filePath, ['doc-a', 'doc-b'], 's1'))!.sort()).toEqual(['doc-a', 'doc-b']);
+    // Repeat Stop, same adoption → nothing new.
+    expect(await incrementUpvoted(filePath, ['doc-a', 'doc-b'], 's1')).toEqual([]);
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as UserVotesV2;
+    expect(data.votes['doc-a'].upvoted_count).toBe(1);
+    expect(data.votes['doc-b'].upvoted_count).toBe(1);
+  });
+
+  it('credits only newly-adopted docs on a later turn of the same session', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    expect(await incrementUpvoted(filePath, ['doc-a'], 's2')).toEqual(['doc-a']);
+    // Later turn adopts doc-b too; doc-a already credited.
+    expect(await incrementUpvoted(filePath, ['doc-a', 'doc-b'], 's2')).toEqual(['doc-b']);
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as UserVotesV2;
+    expect(data.votes['doc-a'].upvoted_count).toBe(1);
+    expect(data.votes['doc-b'].upvoted_count).toBe(1);
+  });
+
+  it('shares one ledger across foreground + judge so a doc is not double-counted', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    // Judge credits doc-a first (same session id).
+    expect(await incrementUpvoted(filePath, ['doc-a'], 's3')).toEqual(['doc-a']);
+    // Foreground later sees the agent open doc-a → must NOT count it again.
+    expect(await incrementUpvoted(filePath, ['doc-a'], 's3')).toEqual([]);
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as UserVotesV2;
+    expect(data.votes['doc-a'].upvoted_count).toBe(1);
+  });
+
+  it('tracks sessions independently', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    expect(await incrementUpvoted(filePath, ['doc-a'], 'sA')).toEqual(['doc-a']);
+    // Different session credits it again (its own ledger).
+    expect(await incrementUpvoted(filePath, ['doc-a'], 'sB')).toEqual(['doc-a']);
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as UserVotesV2;
+    expect(data.votes['doc-a'].upvoted_count).toBe(2);
+  });
+
+  it('tolerates a corrupted ledger entry (non-array docIds) without crashing', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    // Hand-corrupted file: docIds is a string, not an array.
+    fs.writeFileSync(filePath, YAML.stringify({
+      version: 2, votes: {}, deltas: {},
+      upvotedSessions: { bad: { docIds: 'not-an-array', ts: new Date().toISOString() } },
+    }));
+    // Must not iterate the string per-character; a fresh session credits cleanly.
+    const credited = await incrementUpvoted(filePath, ['doc-a'], 'good');
+    expect(credited).toEqual(['doc-a']);
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as UserVotesV2;
+    expect(data.votes['doc-a'].upvoted_count).toBe(1);
+  });
+});
+
+describe('pruneUpvoteLedger (bounded even in judge-off config)', () => {
+  it('drops stale session entries but keeps fresh ones', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString(); // 3 days
+    const fresh = new Date().toISOString();
+    fs.writeFileSync(filePath, YAML.stringify({
+      version: 2, votes: {}, deltas: {},
+      upvotedSessions: { stale: { docIds: ['x'], ts: old }, live: { docIds: ['y'], ts: fresh } },
+    }));
+
+    await pruneUpvoteLedger(filePath);
+
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as unknown as { upvotedSessions: Record<string, unknown> };
+    expect(Object.keys(data.upvotedSessions)).toEqual(['live']);
+  });
+
+  it('is a no-op (no throw) when there is no ledger', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    fs.writeFileSync(filePath, YAML.stringify({ version: 2, votes: {}, deltas: {} }));
+    await expect(pruneUpvoteLedger(filePath)).resolves.toBeUndefined();
+  });
+
+  it('measures TTL from firstTs, not the refreshed ts (a long session cannot slide its window forever)', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    const oldStart = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(); // 2 days ago
+    const freshUpdate = new Date().toISOString();
+    // A session that started 2 days ago but was refreshed just now: pruning on
+    // the last-updated ts would keep it forever; pruning on firstTs drops it.
+    fs.writeFileSync(filePath, YAML.stringify({
+      version: 2, votes: {}, deltas: {},
+      upvotedSessions: { longlived: { docIds: ['doc-a'], ts: freshUpdate, firstTs: oldStart } },
+    }));
+
+    await pruneUpvoteLedger(filePath);
+
+    const data = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as unknown as { upvotedSessions?: Record<string, unknown> };
+    expect(data.upvotedSessions ?? {}).toEqual({});
+  });
+
+  it('preserves firstTs across turns while refreshing ts (so dedup holds within the window)', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    // Turn 1 credits doc-a; turn 2 credits doc-b in the same session.
+    expect(await incrementUpvoted(filePath, ['doc-a'], 'sLong')).toEqual(['doc-a']);
+    const after1 = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as unknown as { upvotedSessions: Record<string, { ts: string; firstTs: string }> };
+    const firstTs1 = after1.upvotedSessions.sLong.firstTs;
+    expect(firstTs1).toBeTruthy();
+
+    await new Promise((r) => setTimeout(r, 5));
+    expect(await incrementUpvoted(filePath, ['doc-b'], 'sLong')).toEqual(['doc-b']);
+    const after2 = YAML.parse(fs.readFileSync(filePath, 'utf-8')) as unknown as { upvotedSessions: Record<string, { ts: string; firstTs: string }> };
+    // firstTs unchanged; the same doc is still deduped.
+    expect(after2.upvotedSessions.sLong.firstTs).toBe(firstTs1);
+    expect(await incrementUpvoted(filePath, ['doc-a'], 'sLong')).toEqual([]);
+  });
+});
+
+describe('creditedDocIdsForSession (#6: read-only, no v1 migration write)', () => {
+  it('reads the session ledger from a v2 file', async () => {
+    const filePath = path.join(tmpDir, 'user.yaml');
+    await incrementUpvoted(filePath, ['doc-a', 'doc-b'], 'sX');
+    const got = await creditedDocIdsForSession(filePath, 'sX');
+    expect([...got].sort()).toEqual(['doc-a', 'doc-b']);
+  });
+
+  it('does NOT migrate/rewrite a v1 file (no unlocked write that could clobber a concurrent increment)', async () => {
+    const filePath = path.join(tmpDir, 'legacy.yaml');
+    // A v1 votes file (no version:2). loadUserVotes would migrate+save this;
+    // creditedDocIdsForSession must not.
+    const v1 = 'votes:\n  doc-a:\n    at: "2026-01-01T00:00:00Z"\n';
+    fs.writeFileSync(filePath, v1);
+    const before = fs.readFileSync(filePath, 'utf-8');
+    const got = await creditedDocIdsForSession(filePath, 'sX');
+    expect([...got]).toEqual([]); // v1 has no ledger
+    expect(fs.readFileSync(filePath, 'utf-8')).toBe(before); // untouched
+  });
+
+  it('returns empty for a missing or corrupt file without throwing', async () => {
+    expect([...await creditedDocIdsForSession(path.join(tmpDir, 'nope.yaml'), 's')]).toEqual([]);
+    const bad = path.join(tmpDir, 'bad.yaml');
+    fs.writeFileSync(bad, ': : not yaml : :');
+    expect([...await creditedDocIdsForSession(bad, 's')]).toEqual([]);
   });
 });
 
@@ -343,14 +565,263 @@ describe('syncVotesToTeam', () => {
     const synced = await syncVotesToTeam(repoDir, 'jeff', localDir);
     expect(synced).toBe(false);
   });
+
+  // Issue #723 review: sync must clear ONLY the deltas it synced. A delta added
+  // after the sync snapshot (e.g. the detached judge upvoting) must survive to
+  // the next sync instead of being erased by a blind `deltas: {}`.
+  it('preserves a delta added after the synced set, syncing it on the next pass', async () => {
+    const localDir = path.join(tmpDir, 'local-votes');
+    const repoDir = path.join(tmpDir, 'repo');
+    fs.mkdirSync(localDir, { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'votes'), { recursive: true });
+
+    const localPath = path.join(localDir, 'jeff.yaml');
+    const remotePath = path.join(repoDir, 'votes', 'jeff.yaml');
+
+    // First increment + sync credits doc-a to remote and clears its delta.
+    await incrementUpvoted(localPath, ['doc-a']);
+    expect(await syncVotesToTeam(repoDir, 'jeff', localDir)).toBe(true);
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf-8')).deltas).toEqual({});
+    expect(YAML.parse(fs.readFileSync(remotePath, 'utf-8')).votes['doc-a'].upvoted_count).toBe(1);
+
+    // A later increment (doc-b) arrives; syncing again must add doc-b to remote
+    // WITHOUT losing doc-a's already-synced count.
+    await incrementUpvoted(localPath, ['doc-b']);
+    expect(await syncVotesToTeam(repoDir, 'jeff', localDir)).toBe(true);
+    const remote = YAML.parse(fs.readFileSync(remotePath, 'utf-8'));
+    expect(remote.votes['doc-a'].upvoted_count).toBe(1);
+    expect(remote.votes['doc-b'].upvoted_count).toBe(1);
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf-8')).deltas).toEqual({});
+  });
+});
+
+describe('stageVotesMerge / confirmVotesSynced (#1027)', () => {
+  /** Local votes dir seeded with one pending upvote for doc-a. */
+  const seedPending = (): { localDir: string; repoDir: string; localPath: string; remotePath: string } => {
+    const localDir = path.join(tmpDir, 'local-votes');
+    const repoDir = path.join(tmpDir, 'repo');
+    fs.mkdirSync(localDir, { recursive: true });
+    fs.mkdirSync(path.join(repoDir, 'votes'), { recursive: true });
+    const localPath = path.join(localDir, 'jeff.yaml');
+    const remotePath = path.join(repoDir, 'votes', 'jeff.yaml');
+    return { localDir, repoDir, localPath, remotePath };
+  };
+
+  it('staging merges into the worktree but keeps the local deltas until confirmed', async () => {
+    const { localDir, repoDir, localPath, remotePath } = seedPending();
+    await incrementUpvoted(localPath, ['doc-a']);
+
+    const staged = await stageVotesMerge(repoDir, 'jeff', localDir, null);
+    expect(staged).not.toBeNull();
+
+    // The merged result reached the worktree…
+    const remote = YAML.parse(fs.readFileSync(remotePath, 'utf-8'));
+    expect(remote.votes['doc-a'].upvoted_count).toBe(1);
+    // …but the local deltas survive: an unpublished push must not lose the
+    // sync trigger (#1027).
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf-8')).deltas).toEqual({
+      'doc-a': { recalled_delta: 0, upvoted_delta: 1 },
+    });
+
+    // Once the publish is confirmed, the staged set is cleared.
+    await confirmVotesSynced(localPath, staged!.syncedDeltas);
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf-8')).deltas).toEqual({});
+    expect(await hasPendingVoteDeltas(localDir, 'jeff')).toBe(false);
+  });
+
+  it('re-staging onto the same origin snapshot is idempotent (a failed push does not double-count)', async () => {
+    const { localDir, repoDir, localPath, remotePath } = seedPending();
+    await incrementRecalled(localPath, ['doc-a']);
+    await incrementUpvoted(localPath, ['doc-a']);
+
+    // Origin holds R; attempt 1 stages D onto R. Its push fails, so origin
+    // stays R and the worktree file keeps R+D.
+    const originBase: UserVotesV2 = {
+      version: 2,
+      votes: { 'doc-a': { recalled_count: 2, upvoted_count: 0, last_recalled_at: '2026-06-01T00:00:00Z' } },
+      deltas: {},
+    };
+    await stageVotesMerge(repoDir, 'jeff', localDir, originBase);
+    expect(YAML.parse(fs.readFileSync(remotePath, 'utf-8')).votes['doc-a']).toMatchObject({
+      recalled_count: 3,
+      upvoted_count: 1,
+    });
+
+    // Retry with the SAME origin snapshot (the push never landed): merging the
+    // same deltas again must reproduce the same content, not add them twice.
+    await stageVotesMerge(repoDir, 'jeff', localDir, originBase);
+    expect(YAML.parse(fs.readFileSync(remotePath, 'utf-8')).votes['doc-a']).toMatchObject({
+      recalled_count: 3,
+      upvoted_count: 1,
+    });
+
+    // Delivery confirmed → the deltas go, exactly once.
+    await confirmVotesSynced(localPath, (await stageVotesMerge(repoDir, 'jeff', localDir, originBase))!.syncedDeltas);
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf8')).deltas).toEqual({});
+  });
+
+  it('recognizes a push that landed without its confirmation, instead of replaying it (#1027)', async () => {
+    const { localDir, repoDir, localPath, remotePath } = seedPending();
+    await incrementRecalled(localPath, ['doc-a']);
+    await incrementUpvoted(localPath, ['doc-a']);
+
+    const originBase: UserVotesV2 = {
+      version: 2,
+      votes: { 'doc-a': { recalled_count: 2, upvoted_count: 0, last_recalled_at: '2026-06-01T00:00:00Z' } },
+      deltas: {},
+    };
+    await stageVotesMerge(repoDir, 'jeff', localDir, originBase);
+    expect(YAML.parse(fs.readFileSync(remotePath, 'utf8')).votes['doc-a']).toMatchObject({
+      recalled_count: 3,
+      upvoted_count: 1,
+    });
+
+    // The push LANDED — origin now reads back exactly the merged content — but
+    // the process died before confirmVotesSynced ran: the deltas and the
+    // delivery watermark are both still local. The next stage must recognize
+    // delivery and only subtract, never re-add (R + 2D).
+    const originNow = readUserVotesFromContent(fs.readFileSync(remotePath, 'utf8'));
+    expect(await stageVotesMerge(repoDir, 'jeff', localDir, originNow)).toBeNull();
+
+    expect(YAML.parse(fs.readFileSync(remotePath, 'utf8')).votes['doc-a']).toMatchObject({
+      recalled_count: 3,
+      upvoted_count: 1,
+    });
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf8')).deltas).toEqual({});
+  });
+
+  it('re-merges when origin moved past an unconfirmed delivery id (same user, another checkout)', async () => {
+    const { localDir, repoDir, localPath, remotePath } = seedPending();
+    await incrementRecalled(localPath, ['doc-a']);
+    await incrementUpvoted(localPath, ['doc-a']);
+
+    const originBase: UserVotesV2 = {
+      version: 2,
+      votes: { 'doc-a': { recalled_count: 2, upvoted_count: 0, last_recalled_at: '2026-06-01T00:00:00Z' } },
+      deltas: {},
+    };
+    await stageVotesMerge(repoDir, 'jeff', localDir, originBase);
+
+    // Another checkout of the same user pushed: its file carries its own
+    // delivery id, not ours, so delivery cannot be proven. The deltas re-merge
+    // (the documented double-count when our landed push was superseded) and
+    // the local record is superseded by the new stage.
+    const originMoved = {
+      version: 2,
+      votes: { 'doc-a': { recalled_count: 99, upvoted_count: 5, last_recalled_at: '2026-06-02T00:00:00Z' } },
+      deltas: {},
+      deliveredSyncIds: ['b3f1c0de-0000-4000-8000-000000000001'],
+    } as UserVotesV2 & { deliveredSyncIds: string[] };
+    expect(await stageVotesMerge(repoDir, 'jeff', localDir, originMoved)).not.toBeNull();
+    expect(YAML.parse(fs.readFileSync(remotePath, 'utf8')).votes['doc-a']).toMatchObject({
+      recalled_count: 100,
+      upvoted_count: 6,
+    });
+    // Still unconfirmed: the deltas stay pending until delivery.
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf8')).deltas).toEqual({
+      'doc-a': { recalled_delta: 1, upvoted_delta: 1 },
+    });
+  });
+
+  it("does not treat another checkout's identical counts as this one's delivery (#1027)", async () => {
+    const { localDir, repoDir, localPath, remotePath } = seedPending();
+    await incrementRecalled(localPath, ['doc-a']);
+    await incrementUpvoted(localPath, ['doc-a']);
+
+    const originBase: UserVotesV2 = {
+      version: 2,
+      votes: { 'doc-a': { recalled_count: 2, upvoted_count: 0, last_recalled_at: '2026-06-01T00:00:00Z' } },
+      deltas: {},
+    };
+    await stageVotesMerge(repoDir, 'jeff', localDir, originBase);
+    // This stage's push fails, so its delivery id never reaches origin…
+
+    // …and checkout B of the SAME username independently publishes identical
+    // increments: the counts match this stage's merge exactly, but under B's
+    // own id. Counter equality must not clear our undelivered deltas — the
+    // team would lose one of the two contributions.
+    const originFromB = {
+      version: 2,
+      votes: { 'doc-a': { recalled_count: 3, upvoted_count: 1, last_recalled_at: '2026-06-02T00:00:00Z' } },
+      deltas: {},
+      deliveredSyncIds: ['b3f1c0de-0000-4000-8000-000000000002'],
+    } as UserVotesV2 & { deliveredSyncIds: string[] };
+    expect(await stageVotesMerge(repoDir, 'jeff', localDir, originFromB)).not.toBeNull();
+
+    // Our deltas were re-merged on top, not silently dropped…
+    expect(YAML.parse(fs.readFileSync(remotePath, 'utf8')).votes['doc-a']).toMatchObject({
+      recalled_count: 4,
+      upvoted_count: 2,
+    });
+    // …and they stay pending until OUR push is delivered.
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf8')).deltas).toEqual({
+      'doc-a': { recalled_delta: 1, upvoted_delta: 1 },
+    });
+  });
+
+  it('confirm clears only the staged set: a delta added while the push was in flight survives', async () => {
+    const { localDir, repoDir, localPath, remotePath } = seedPending();
+    await incrementUpvoted(localPath, ['doc-a']);
+
+    const staged = (await stageVotesMerge(repoDir, 'jeff', localDir, null))!;
+
+    // The detached judge (or the user) votes doc-b while the push is in flight,
+    // and doc-a gets one more upvote too.
+    await incrementUpvoted(localPath, ['doc-b']);
+    await incrementUpvoted(localPath, ['doc-a']);
+
+    await confirmVotesSynced(localPath, staged.syncedDeltas);
+    const local = YAML.parse(fs.readFileSync(localPath, 'utf-8'));
+    expect(local.deltas).toEqual({
+      'doc-a': { recalled_delta: 0, upvoted_delta: 1 },
+      'doc-b': { recalled_delta: 0, upvoted_delta: 1 },
+    });
+
+    // The next stage delivers the remainder onto the now-confirmed snapshot.
+    const remote = readUserVotesFromContent(fs.readFileSync(remotePath, 'utf-8'));
+    const next = (await stageVotesMerge(repoDir, 'jeff', localDir, remote))!;
+    const merged = YAML.parse(fs.readFileSync(remotePath, 'utf-8'));
+    expect(merged.votes['doc-a'].upvoted_count).toBe(2);
+    expect(merged.votes['doc-b'].upvoted_count).toBe(1);
+    await confirmVotesSynced(localPath, next.syncedDeltas);
+    expect(YAML.parse(fs.readFileSync(localPath, 'utf-8')).deltas).toEqual({});
+  });
+
+  it('staging returns null when there is nothing pending', async () => {
+    const { localDir, repoDir, localPath } = seedPending();
+    await incrementUpvoted(localPath, ['doc-a']);
+    await stageVotesMerge(repoDir, 'jeff', localDir, null);
+    const local = YAML.parse(fs.readFileSync(localPath, 'utf-8'));
+    fs.writeFileSync(localPath, YAML.stringify({ ...local, deltas: {} }));
+
+    expect(await stageVotesMerge(repoDir, 'jeff', localDir, null)).toBeNull();
+  });
+});
+
+describe('readUserVotesFromContent', () => {
+  it('parses v2 content', () => {
+    const votes = readUserVotesFromContent(
+      YAML.stringify({ version: 2, votes: { d: { recalled_count: 1, upvoted_count: 0, last_recalled_at: '' } }, deltas: { d: { recalled_delta: 1, upvoted_delta: 0 } } }),
+    );
+    expect(votes.votes['d'].recalled_count).toBe(1);
+    expect(votes.deltas['d'].recalled_delta).toBe(1);
+  });
+
+  it('migrates v1 content in memory and reads unparseable content as empty', () => {
+    const v1 = readUserVotesFromContent(YAML.stringify({ votes: { d: { at: '2026-01-01T00:00:00Z' } } }));
+    expect(v1.version).toBe(2);
+    expect(v1.votes['d'].recalled_count).toBe(1);
+
+    expect(readUserVotesFromContent('::: not yaml [').votes).toEqual({});
+    expect(readUserVotesFromContent('').votes).toEqual({});
+  });
 });
 
 describe('recallFeedback', () => {
   beforeEach(() => {
-    vi.doMock('../config.js', () => ({
-      autoDetectInit: () => Promise.resolve({
-        localConfig: { username: 'testuser', repo: { localPath: tmpDir } },
-      }),
+    vi.doMock('../config.js', async (importOriginal) => ({
+      ...(await importOriginal<typeof import('../config.js')>()),
+      resolveConfigForDir: () => Promise.resolve({ username: 'testuser', scope: 'user', repo: { localPath: tmpDir } }),
     }));
   });
 
@@ -359,7 +830,7 @@ describe('recallFeedback', () => {
   });
 
   it('positive increments upvoted_count', async () => {
-    const votesDir = path.join(tmpDir, '.teamai', 'votes');
+    const votesDir = path.join(tmpDir, '.teamai', 'user-votes');
     fs.mkdirSync(votesDir, { recursive: true });
     await incrementRecalled(path.join(votesDir, 'testuser.yaml'), ['doc-a']);
 
@@ -371,7 +842,7 @@ describe('recallFeedback', () => {
   });
 
   it('negative decrements upvoted_count (floor at 0)', async () => {
-    const votesDir = path.join(tmpDir, '.teamai', 'votes');
+    const votesDir = path.join(tmpDir, '.teamai', 'user-votes');
     fs.mkdirSync(votesDir, { recursive: true });
     await incrementRecalled(path.join(votesDir, 'testuser.yaml'), ['doc-b']);
 
@@ -383,7 +854,7 @@ describe('recallFeedback', () => {
   });
 
   it('negative on missing doc warns without crashing', async () => {
-    const votesDir = path.join(tmpDir, '.teamai', 'votes');
+    const votesDir = path.join(tmpDir, '.teamai', 'user-votes');
     fs.mkdirSync(votesDir, { recursive: true });
 
     // Should not throw
@@ -391,7 +862,7 @@ describe('recallFeedback', () => {
   });
 
   it('negative deletes last_upvoted_at when upvoted_count reaches 0', async () => {
-    const votesDir = path.join(tmpDir, '.teamai', 'votes');
+    const votesDir = path.join(tmpDir, '.teamai', 'user-votes');
     fs.mkdirSync(votesDir, { recursive: true });
     const votePath = path.join(votesDir, 'testuser.yaml');
 

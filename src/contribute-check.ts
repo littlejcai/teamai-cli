@@ -2,8 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { log } from './utils/logger.js';
-import { readJson, writeJson, writeJsonAtomic, ensureDir } from './utils/fs.js';
-import { readEvents, aggregateSessionMetrics, scanTranscriptStop } from './dashboard-collector.js';
+import { RELAY_TO_USER_PREFIX, relayWhenHidden } from './utils/hook-output.js';
+import { readJson, writeJson, ensureDir } from './utils/fs.js';
+import { readEvents, aggregateSessionMetrics, scanTranscriptStop, hookScopeDir } from './dashboard-collector.js';
 import { readRecallQuality } from './recall-quality.js';
 import { deriveSessionId } from './utils/session-id.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
@@ -63,7 +64,7 @@ import { getUserHome } from './utils/home.js';
  *
  * sessionId may originate from:
  *   1. hookData.session_id (typically a hex UUID — already safe)
- *   2. process.env.CLAUDE_SESSION_ID
+ *   2. the agent's session variable (e.g. CLAUDE_CODE_SESSION_ID)
  *   3. PID fallback `pid-{pid}-{cwd}` — embeds cwd which contains "/"
  *
  * The PID fallback is the dangerous case: a literal "/" in the filename
@@ -105,7 +106,7 @@ function normalizePromptSummary(raw?: string): string | undefined {
   if (typeof raw !== 'string') return undefined;
   const normalized = redactWithEnv(raw)
     .replace(/[\r\n\t]+/g, ' ')
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '')
+    .replace(/\p{Cc}/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
   if (!normalized) return undefined;
@@ -123,28 +124,6 @@ function getSessionPath(sessionId: string): string {
     '.teamai',
     'sessions',
     `${sanitizeSessionId(sessionId)}.json`,
-  );
-}
-
-/**
- * Get the sidecar used for vote nudges. Keep it separate from the contribute
- * state JSON because the Stop handlers run concurrently and independently.
- */
-function getPendingVotesHintPath(sessionId: string): string {
-  return path.join(
-    getUserHome(),
-    '.teamai',
-    'sessions',
-    `${sanitizeSessionId(sessionId)}.votes-hint.json`,
-  );
-}
-
-function getVotesNudgeMarkerPath(sessionId: string): string {
-  return path.join(
-    getUserHome(),
-    '.teamai',
-    'sessions',
-    `${sanitizeSessionId(sessionId)}.votes-nudged.json`,
   );
 }
 
@@ -363,6 +342,7 @@ async function readStdinAndDeriveSession(): Promise<{
   sessionId: string;
   cwd?: string;
   transcriptPath?: string;
+  hookData: Record<string, unknown>;
 } | null> {
   if (process.stdin.isTTY) return null;
 
@@ -381,7 +361,7 @@ async function readStdinAndDeriveSession(): Promise<{
     const transcriptPath = typeof hookData.transcript_path === 'string'
       ? hookData.transcript_path
       : undefined;
-    return { sessionId, cwd, transcriptPath };
+    return { sessionId, cwd, transcriptPath, hookData };
   } catch {
     return null;
   }
@@ -492,10 +472,9 @@ function buildHint({ friction, promptSummary, isKnowledgeGap }: HintContext): st
   }
   const task = promptSummary ? `\n\nTask: ${promptSummary}` : '';
   const action = isKnowledgeGap
-    ? 'Consider running /teamai-share-learnings to summarize what you learned, share it with your team, and fill the knowledge gap.'
-    : 'Consider running /teamai-share-learnings to summarize what you learned and share it with your team.';
-  const body = `${headline}${task}\n\n${action}`;
-  return `Print the following message verbatim to the user (do NOT paraphrase, summarize, or explain its origin):\n\n${body}`;
+    ? 'Consider running `/teamai share what this session taught me` to summarize what you learned, share it with your team, and fill the knowledge gap (or run `teamai skill get share`).'
+    : 'Consider running `/teamai share what this session taught me` to summarize what you learned and share it with your team (or run `teamai skill get share`).';
+  return `${headline}${task}\n\n${action}`;
 }
 
 /**
@@ -653,7 +632,10 @@ export async function contributeCheckForSession(
     // For tools whose Stop hook ignores stdout, stash the hint in this same
     // write for delivery on the next UserPromptSubmit — no second write.
     if (willHint && stashInsteadOfReturn) {
-      updated.pendingHint = hintText ?? undefined;
+      // The stash is delivered as UserPromptSubmit context, which the host does
+      // not display, so this copy asks the model to relay it. The Stop copy
+      // returned below does not: Claude Code prints that one itself (#719).
+      updated.pendingHint = hintText ? RELAY_TO_USER_PREFIX + hintText : undefined;
     }
     await writeContributeState(sessionId, updated);
   }
@@ -706,60 +688,33 @@ export async function contributeCheck(toolArg?: string): Promise<void> {
     log.debug('contribute-check: no STDIN data or no session ID');
     return;
   }
+  // Hooks of older installs still call this command in every project; a
+  // directory without teamai has no team to share with (#748). The session's
+  // cwd, never the one this process started in; a removed worktree's session
+  // keeps its recorded scope (#810).
+  const scopeDir = await hookScopeDir(stdinData.hookData, toolArg ?? 'claude');
+  const { resolveConfigForDir } = await import('./config.js');
+  if (!(await resolveConfigForDir(scopeDir))) {
+    log.debug('contribute-check: teamai is not set up here, skipping');
+    return;
+  }
 
-  const { STOP_STDOUT_UNSUPPORTED_TOOLS } = await import('./utils/tool-names.js');
+  // The same gate as the dispatcher's handler: hooks written before it still
+  // call this command, and must not nudge towards a `share` that refuses.
+  const { contributeHintAllowed } = await import('./skill-content.js');
+  if (!(await contributeHintAllowed(scopeDir))) return;
+
+  const { stopStdoutUnsupported } = await import('./utils/tool-names.js');
   const tool = toolArg?.toLowerCase() ?? 'claude';
   const { hint } = await contributeCheckForSession(
     stdinData.sessionId,
     stdinData.cwd,
     stdinData.transcriptPath,
-    STOP_STDOUT_UNSUPPORTED_TOOLS.has(tool),
+    stopStdoutUnsupported(tool),
   );
   if (hint !== null) {
     const { formatStopHookOutput } = await import('./utils/hook-output.js');
-    process.stdout.write(formatStopHookOutput(hint, tool));
-  }
-}
-
-/**
- * Stash a votes-nudge hint for delivery on the next UserPromptSubmit.
- * Used for tools (codebuddy/workbuddy) whose Stop hook ignores stdout.
- */
-export async function stashVotesHint(sessionId: string, hintText: string): Promise<void> {
-  try {
-    await writeJsonAtomic(getPendingVotesHintPath(sessionId), { hintText });
-  } catch (e) {
-    log.error(`Failed to write pending votes hint: ${(e as Error).message}`);
-  }
-}
-
-/**
- * Read and clear a pending votes-nudge hint for this session, if any.
- * Returns the hint text or null. The independent sidecar is atomically written
- * so a concurrent prompt-submit never observes a truncated hint.
- */
-export async function takePendingVotesHint(sessionId: string): Promise<string | null> {
-  const sidecarPath = getPendingVotesHintPath(sessionId);
-  const pending = await readJson<{ hintText?: unknown }>(sidecarPath);
-  if (!pending || typeof pending.hintText !== 'string' || !pending.hintText) return null;
-  await fs.promises.unlink(sidecarPath).catch(() => undefined);
-  return pending.hintText;
-}
-
-/** Atomically cap Cursor's Stop follow-up nudge to once per session. */
-export async function claimVotesNudge(sessionId: string): Promise<boolean> {
-  const markerPath = getVotesNudgeMarkerPath(sessionId);
-  try {
-    await ensureDir(path.dirname(markerPath));
-    await fs.promises.writeFile(markerPath, '{}\n', { encoding: 'utf-8', flag: 'wx' });
-    // The claim is complete once the exclusive marker write succeeds. Cleanup
-    // is best-effort and must not swallow Cursor's one allowed nudge.
-    await cleanupStaleSessions(path.dirname(markerPath), sessionId).catch(() => undefined);
-    return true;
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
-    log.error(`Failed to claim votes nudge: ${(e as Error).message}`);
-    return false;
+    process.stdout.write(formatStopHookOutput(relayWhenHidden(hint, tool), tool));
   }
 }
 

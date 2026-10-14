@@ -1,7 +1,18 @@
 import path from 'node:path';
-import { pathExists, ensureDir } from './utils/fs.js';
-import { resolveBaseDir, isAgentDisabled, scopedToolPaths } from './types.js';
-import { toolInstallRoot } from './resources/base.js';
+import { pathExists, ensureDir, writeJson } from './utils/fs.js';
+import {
+  COPILOT_TOOL_ID,
+  getCopilotHome,
+  resolveBaseDir,
+  resolveToolBaseDir,
+  isAgentDisabled,
+  isSelfMode,
+  resolveHookScope,
+  scopedToolPaths,
+  toolGateRoot,
+  detectToolRoot,
+} from './types.js';
+import { isToolInstalledForConfig } from './resources/base.js';
 import type { LocalConfig, TeamaiConfig, Scope } from './types.js';
 import { getUserHome } from './utils/home.js';
 
@@ -11,7 +22,7 @@ import { getUserHome } from './utils/home.js';
  * against the user's HOME in non-interactive contexts. Order is the display order.
  * Kept small on purpose — the common coding agents, not the full KNOWN_AGENTS list.
  */
-export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'joycode', 'codebuddy', 'workbuddy'] as const;
+export const SELF_MODE_AGENT_CHOICES = ['claude', 'codex', 'cursor', 'copilot', 'pi', 'joycode', 'codebuddy', 'workbuddy', 'muse'] as const;
 
 /**
  * Normalize the `--agent` option into a deduplicated id list.
@@ -86,19 +97,23 @@ export const KNOWN_AGENTS: KnownAgent[] = [
   { id: 'amp', displayName: 'Amp', category: 'coding', skillsPath: '.amp/skills' },
   { id: 'augment', displayName: 'Augment', category: 'coding', skillsPath: '.augment/skills' },
   { id: 'copilot', displayName: 'Copilot', category: 'coding', skillsPath: '.copilot/skills' },
+  { id: 'pi', displayName: 'Pi Coding Agent', category: 'coding', skillsPath: '.pi/skills' },
   { id: 'factory', displayName: 'Factory Droid', category: 'coding', skillsPath: '.factory/skills' },
   { id: 'hermes', displayName: 'Hermes', category: 'coding', skillsPath: '.hermes/skills' },
   { id: 'junie', displayName: 'Junie', category: 'coding', skillsPath: '.junie/skills' },
   { id: 'kilocode', displayName: 'KiloCode', category: 'coding', skillsPath: '.kilocode/skills' },
   { id: 'kiro', displayName: 'Kiro', category: 'coding', skillsPath: '.kiro/skills' },
   { id: 'ob1', displayName: 'OB1', category: 'coding', skillsPath: '.ob1/skills' },
+  { id: 'omp', displayName: 'Oh My Pi', category: 'coding', skillsPath: '.omp/skills' },
   { id: 'opencode', displayName: 'OpenCode', category: 'coding', skillsPath: '.opencode/skills' },
   { id: 'qoder', displayName: 'Qoder', category: 'coding', skillsPath: '.qoder/skills' },
+  { id: 'qoder-cn', displayName: 'Qoder CN', category: 'coding', skillsPath: '.qoder-cn/skills' },
   { id: 'qwen', displayName: 'Qwen', category: 'coding', skillsPath: '.qwen/skills' },
   { id: 'trae', displayName: 'Trae', category: 'coding', skillsPath: '.trae/skills' },
   { id: 'trae-cn', displayName: 'Trae CN', category: 'coding', skillsPath: '.trae-cn/skills' },
   { id: 'windsurf', displayName: 'Windsurf', category: 'coding', skillsPath: '.windsurf/skills' },
   { id: 'zcode', displayName: 'ZCode', category: 'coding', skillsPath: '.zcode/skills' },
+  { id: 'muse', displayName: 'Muse Code', category: 'coding', skillsPath: '.config/muse/skills' },
 
   // Lobster family
   { id: 'openclaw', displayName: 'OpenClaw', category: 'lobster', skillsPath: '.openclaw/skills' },
@@ -132,21 +147,34 @@ export interface ResolvedAgent extends KnownAgent {
  * skillsPath (admin can override the default location).
  */
 /**
- * Single-repo mode: seed the tool skills-directory root for the agents this
- * project should sync to, so that first-run injection actually lands.
+ * Seed the tool skills-directory root for the agents this scope should sync
+ * to, so that first-run injection actually lands.
  *
- * In git/user modes, `teamai pull` only injects into AI tools whose root dir
- * already exists (isToolInstalled) — the user "opts in" by having e.g. ~/.claude.
- * But single-repo mode's whole promise is "clone → auto-inject": a teammate's
- * fresh clone has no <repo>/.claude yet, so nothing would ever inject. Seeding
- * the dir here makes hooks + skills deploy on the first pull.
+ * `teamai pull` only injects into AI tools whose root dir already exists
+ * (isToolInstalled) — normally the user "opts in" by having e.g. ~/.claude
+ * before ever running teamai. Two cases break that assumption, and both call
+ * this to seed the dir instead of relying on it already being there:
  *
- * Which agents: strictly `localConfig.enabledAgents`. The caller decides that set
- * — interactively (multi-select in `teamai init .`), from `--agent`, or by probing
- * the user's HOME in non-interactive contexts (see detectHomeInstalledAgents).
- * We deliberately do NOT fall back to a hardcoded default here: an empty
- * enabledAgents means "create nothing", so no `.claude/` is conjured for someone
- * who never asked for it.
+ * - Single-repo mode's whole promise is "clone → auto-inject": a teammate's
+ *   fresh clone has no <repo>/.claude yet, so nothing would ever inject.
+ * - Any mode's `--agent <id>` naming a custom agent configured only in
+ *   `teamai.yaml`'s `toolPaths` (not one of the built-in tools a user
+ *   installs themselves): its root is not something anything else ever
+ *   creates, so without seeding, `--agent` would name a target `pull` can
+ *   never actually reach (#867).
+ *
+ * Outside self mode, only the second case applies: a built-in tool (one
+ * KNOWN_AGENTS already lists) is left alone even if enabled, since its root
+ * already existing is exactly what `doctor`'s "is installed" check verifies
+ * (#598) — seeding it here would silently manufacture a directory for
+ * software that was never actually installed.
+ *
+ * Which agents: strictly `localConfig.enabledAgents`. The caller decides that
+ * set — interactively (multi-select in `teamai init .`), from `--agent`, or
+ * by probing the user's HOME in non-interactive contexts (see
+ * detectHomeInstalledAgents). We deliberately do NOT fall back to a
+ * hardcoded default here: an empty enabledAgents means "create nothing", so
+ * no `.claude/` is conjured for someone who never asked for it.
  *
  * Returns the list of agent ids whose dirs were ensured.
  */
@@ -154,8 +182,20 @@ export async function seedSelfModeToolDirs(
   localConfig: LocalConfig,
   teamConfig: TeamaiConfig,
 ): Promise<string[]> {
+  const selfMode = isSelfMode(localConfig);
   const baseDir = resolveBaseDir(localConfig);
-  const configured = teamConfig.toolPaths ?? {};
+  const configured = scopedToolPaths(teamConfig, localConfig);
+
+  // Non-self project scope injects hooks into HOME, not the project root
+  // (`resolveHookScope`, #264): `~/.claude` always exists for a built-in tool,
+  // so that gate passes, but a custom tool's HOME root is not something
+  // anything else creates either. Seed there too when it differs, or the
+  // custom agent's session-start hook is silently skipped (#867 review).
+  const hookScope = resolveHookScope(localConfig);
+  const seedHookRoot = hookScope.baseDir !== baseDir;
+  const hookConfigured = seedHookRoot
+    ? scopedToolPaths(teamConfig, { ...localConfig, scope: hookScope.scope })
+    : configured;
 
   let targets = localConfig.enabledAgents ?? [];
   // Never seed an explicitly disabled agent.
@@ -163,11 +203,85 @@ export async function seedSelfModeToolDirs(
 
   const seeded: string[] = [];
   for (const id of targets) {
-    const skillsPath = configured[id]?.skills
-      ?? KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
-    if (!skillsPath) continue;
-    await ensureDir(path.join(baseDir, skillsPath));
-    seeded.push(id);
+    const isCustom = !KNOWN_AGENTS.some((a) => a.id === id);
+    if (!selfMode && !isCustom) continue;
+
+    const fallbackSkills = KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
+    let ensured = await seedToolRoots(id, baseDir, configured[id], fallbackSkills, localConfig.toolRoots);
+    // The HOME pass is restricted to what hook installation actually reads
+    // (settings/hooks) — seeding skills/rules/agents/claudemd there too would
+    // create a redundant directory for a tool with no settings-based hook
+    // surface (#867 review, P2).
+    if (seedHookRoot && await seedHookInstallRoot(id, hookScope.baseDir, hookConfigured[id], localConfig.toolRoots)) ensured = true;
+    if (ensured) seeded.push(id);
+  }
+  return seeded;
+}
+
+/**
+ * Every distinct root a tool's configured resource paths imply, ensured on
+ * disk. skills/rules/agents are directories themselves; claudemd is a FILE
+ * (e.g. "a/AGENTS.md" — see ToolPathsSchema), so ensureDir-ing it directly
+ * would create a directory literally named "AGENTS.md" — a nested one seeds
+ * its parent root instead. A bare root-level claudemd (no "/") has no parent
+ * to create — its own "installed" check keys off a `.${tool}` directory
+ * convention instead (local-agent.ts), unrelated to its own path, so it is
+ * left alone here. settings/hooks are handled by seedHookInstallRoot.
+ *
+ * The root created is the one the gate reads (`toolGateRoot`), not the
+ * two-segment shape of the path: seeding a prefix the gate no longer probes
+ * would leave the tool looking uninstalled and the hook injection skipped.
+ */
+async function seedToolRoots(
+  tool: string,
+  baseDir: string,
+  paths: ReturnType<typeof scopedToolPaths>[string] | undefined,
+  fallbackSkills?: string,
+  toolRoots?: Record<string, string>,
+): Promise<boolean> {
+  const dirPaths = [paths?.skills, paths?.rules, paths?.agents].filter((p): p is string => !!p);
+  if (dirPaths.length === 0 && fallbackSkills) dirPaths.push(fallbackSkills);
+  for (const dirPath of dirPaths) await ensureDir(path.join(baseDir, dirPath));
+
+  let ensuredAnything = dirPaths.length > 0;
+  const claudemd = paths?.claudemd;
+  if (claudemd) {
+    const claudemdRoot = toolGateRoot(tool, claudemd, toolRoots);
+    if (claudemdRoot !== claudemd) {
+      await ensureDir(path.join(baseDir, claudemdRoot));
+      ensuredAnything = true;
+    }
+  }
+  if (await seedHookInstallRoot(tool, baseDir, paths, toolRoots)) ensuredAnything = true;
+  return ensuredAnything;
+}
+
+/**
+ * The root `reconcileHooksToAllTools`'s generic per-tool gate and doctor's
+ * own probe actually read (`paths.settings ?? paths.hooks`), ensured on disk.
+ * Nested, that's its parent directory, same as any other file-valued path.
+ * Bare (no "/"), there is no parent — the gate checks the FILE itself
+ * (`toolGateRoot` returns a bare path unchanged) — but reconcileHooks
+ * already treats a missing settings/hooks file as `{}`, so an empty JSON
+ * object satisfies the gate and gives it something valid to merge into,
+ * instead of a bogus same-named directory.
+ */
+async function seedHookInstallRoot(
+  tool: string,
+  baseDir: string,
+  paths: ReturnType<typeof scopedToolPaths>[string] | undefined,
+  toolRoots?: Record<string, string>,
+): Promise<boolean> {
+  let seeded = false;
+  for (const filePath of [paths?.settings, paths?.hooks].filter((p): p is string => !!p)) {
+    const root = toolGateRoot(tool, filePath, toolRoots);
+    if (root !== filePath) {
+      await ensureDir(path.join(baseDir, root));
+    } else {
+      const full = path.join(baseDir, filePath);
+      if (!await pathExists(full)) await writeJson(full, {});
+    }
+    seeded = true;
   }
   return seeded;
 }
@@ -191,11 +305,20 @@ export async function detectHomeInstalledAgents(
 
   const found: string[] = [];
   for (const id of candidateIds) {
+    if (id === COPILOT_TOOL_ID) {
+      if (await pathExists(getCopilotHome())) found.push(id);
+      continue;
+    }
     const skillsPath = KNOWN_AGENTS.find((a) => a.id === id)?.skillsPath;
     if (!skillsPath) continue;
-    const rootSegment = skillsPath.split('/')[0]; // e.g. ".claude"
-    if (!rootSegment) continue;
-    if (await pathExists(path.join(home, rootSegment))) {
+    // The tool's own dir, e.g. ".claude" or ".config/muse" — never a shared
+    // parent like ".config" that exists on most machines.
+    const rootSegment = path.posix.dirname(skillsPath);
+    // A Claude Code relocated with CLAUDE_CONFIG_DIR (or a Codex with
+    // CODEX_HOME) may have no default root at all; the developer still uses
+    // it. This runs before any config exists, so the variable is the only signal.
+    const relocated = detectToolRoot(id);
+    if (await pathExists(path.join(home, rootSegment)) || (relocated !== null && await pathExists(relocated))) {
       found.push(id);
     }
   }
@@ -240,7 +363,6 @@ export function getEffectiveAgents(
  * detection lines up with what `teamai pull` actually writes to.
  */
 export async function detectInstalledAgents(localConfig: LocalConfig, teamConfig: TeamaiConfig): Promise<ResolvedAgent[]> {
-  const baseDir = resolveBaseDir(localConfig);
   const agents = getEffectiveAgents(teamConfig, localConfig);
   const scoped = scopedToolPaths(teamConfig, localConfig);
   const fromTeamConfig = new Set(
@@ -251,12 +373,11 @@ export async function detectInstalledAgents(localConfig: LocalConfig, teamConfig
 
   const results: ResolvedAgent[] = [];
   for (const agent of agents) {
-    const rootSegment = toolInstallRoot(agent.skillsPath);
-    const rootPath = path.join(baseDir, rootSegment);
-    const installed = rootSegment ? await pathExists(rootPath) : false;
+    const baseDir = resolveToolBaseDir(agent.id, localConfig);
+    const installed = await isToolInstalledForConfig(agent.id, agent.skillsPath, localConfig);
     results.push({
       ...agent,
-      absoluteSkillsPath: `${baseDir}/${agent.skillsPath}`,
+      absoluteSkillsPath: path.join(baseDir, agent.skillsPath),
       installed,
       fromTeamConfig: fromTeamConfig.has(agent.id),
     });

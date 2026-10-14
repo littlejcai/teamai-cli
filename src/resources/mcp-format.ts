@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import type { McpServerDef, McpTransport } from '../types.js';
+import { sameEnvName } from './env-key.js';
 
 // ─── Per-tool rendering ──────────────────────────────────────
 //
@@ -7,26 +8,32 @@ import type { McpServerDef, McpTransport } from '../types.js';
 //
 //    claude family   { "type": "http", "url", "headers" }
 //    cursor          { "url", "headers" }                     (type omitted)
+//    copilot         { "type": "local"|"http", ..., "tools": ["*"] }
 //    buddy family    { "transportType": "streamable-http", … } (+ timeout)
 //    codex           [mcp_servers.<name>] TOML table          (stdio + http)
 //
 //  Keeping the differences here — rather than in the reconcile engine — is the
 //  same split agents uses between agent-format.ts and its handler.
 
-export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode';
+export type McpFormat = 'claude' | 'cursor' | 'buddy' | 'codex' | 'opencode' | 'copilot' | 'pi' | 'muse';
 
-const CLAUDE_TOOLS = new Set(['claude', 'claude-internal', 'tclaude', 'qoder', 'kiro', 'zcode']);
+const CLAUDE_TOOLS = new Set(['claude', 'claude-internal', 'tclaude', 'qoder', 'qoder-cn', 'kiro', 'zcode', 'omp', 'trae', 'trae-cn']);
 const CURSOR_TOOLS = new Set(['cursor']);
 const CODEX_TOOLS = new Set(['codex', 'codex-internal', 'tcodex']);
 const BUDDY_TOOLS = new Set(['codebuddy', 'workbuddy']);
 const OPENCODE_TOOLS = new Set(['opencode']);
+const COPILOT_TOOLS = new Set(['copilot']);
+const COPILOT_ALL_TOOLS = '*';
 
 export function detectMcpFormat(tool: string): McpFormat | null {
+  if (tool === 'pi') return 'pi';
+  if (tool === 'muse') return 'muse';
   if (CLAUDE_TOOLS.has(tool)) return 'claude';
   if (CURSOR_TOOLS.has(tool)) return 'cursor';
   if (CODEX_TOOLS.has(tool)) return 'codex';
   if (BUDDY_TOOLS.has(tool)) return 'buddy';
   if (OPENCODE_TOOLS.has(tool)) return 'opencode';
+  if (COPILOT_TOOLS.has(tool)) return 'copilot';
   return null;
 }
 
@@ -36,14 +43,27 @@ export function detectMcpFormat(tool: string): McpFormat | null {
  * has no entry here.
  */
 export const MCP_SERVER_KEY: Record<Exclude<McpFormat, 'codex'>, string> = {
+  pi: 'mcpServers',
+  muse: 'mcpServers',
   claude: 'mcpServers',
   cursor: 'mcpServers',
   buddy: 'mcpServers',
   opencode: 'mcp',
+  copilot: 'mcpServers',
 };
+
+/** Whether two formats keep their servers under one key of a shared file (Claude, Cursor and CodeBuddy all use `mcpServers`). */
+export function sameServerKey(a: McpFormat, b: McpFormat): boolean {
+  if (a === 'codex' || b === 'codex') return a === b;
+  return MCP_SERVER_KEY[a] === MCP_SERVER_KEY[b];
+}
 
 /** Transports each format can actually express. */
 const SUPPORTED_TRANSPORTS: Record<McpFormat, Set<McpTransport>> = {
+  pi: new Set<McpTransport>(['stdio', 'http']),
+  // Muse Code fails startup validation on a single `type: sse` server and then
+  // loads no MCP server at all.
+  muse: new Set<McpTransport>(['stdio', 'http']),
   claude: new Set<McpTransport>(['stdio', 'http', 'sse']),
   cursor: new Set<McpTransport>(['stdio', 'http', 'sse']),
   buddy: new Set<McpTransport>(['stdio', 'http', 'sse']),
@@ -51,8 +71,9 @@ const SUPPORTED_TRANSPORTS: Record<McpFormat, Set<McpTransport>> = {
   // no SSE transport, so only that one is skipped.
   codex: new Set<McpTransport>(['stdio', 'http']),
   // OpenCode splits transports into `type: local` (stdio) and `type: remote`
-  // (streamable HTTP). It has no SSE transport.
-  opencode: new Set<McpTransport>(['stdio', 'http']),
+  // (streamable HTTP or SSE, negotiated by its client).
+  opencode: new Set<McpTransport>(['stdio', 'http', 'sse']),
+  copilot: new Set<McpTransport>(['stdio', 'http', 'sse']),
 };
 
 export function supportsTransport(format: McpFormat, transport: McpTransport): boolean {
@@ -136,15 +157,23 @@ export interface ResolveResult {
   missing: string[];
 }
 
+/** The value `${name}` takes from `vars`: on Windows `${token}` names the `TOKEN` a table holds, one environment variable. */
+export function placeholderValue(vars: Record<string, string>, name: string): string | undefined {
+  if (Object.hasOwn(vars, name)) return vars[name];
+  const other = sameEnvName(Object.keys(vars), name);
+  return other === undefined ? undefined : vars[other];
+}
+
 /**
  * Substitute ${VAR} throughout a def. Unresolved vars are left as-is and
  * reported, so the caller can skip the server rather than inject a broken one.
  */
 export function resolvePlaceholders(def: McpServerDef, vars: Record<string, string>): ResolveResult {
   const missing = new Set<string>();
+  const lookup = (name: string): string | undefined => placeholderValue(vars, name);
   const sub = (v: string): string =>
     v.replace(PLACEHOLDER_RE, (whole, name: string) => {
-      const val = vars[name];
+      const val = lookup(name);
       if (val === undefined || val === '') {
         missing.add(name);
         return whole;
@@ -227,9 +256,27 @@ function renderBuddy(def: McpServerDef): McpJsonEntry {
   return e;
 }
 
+/** Copilot requires a transport type and an explicit tool allowlist. */
+function renderCopilot(def: McpServerDef): McpJsonEntry {
+  const e: McpJsonEntry = {
+    type: def.transport === 'stdio' ? 'local' : def.transport,
+    tools: [COPILOT_ALL_TOOLS],
+  };
+  if (def.transport === 'stdio') {
+    e.command = def.command;
+    e.args = def.args ?? [];
+    if (def.env && Object.keys(def.env).length) e.env = def.env;
+  } else {
+    e.url = def.url;
+    if (def.headers && Object.keys(def.headers).length) e.headers = def.headers;
+  }
+  if (def.timeout !== undefined) e.timeout = def.timeout;
+  return e;
+}
+
 /**
  * OpenCode's shape is unlike the others: transport is expressed as
- * `type: "local"` (stdio) or `type: "remote"` (http), a local server's command
+ * `type: "local"` (stdio) or `type: "remote"` (http/sse), a local server's command
  * and args are a single `command` array, env is `environment` (not `env`), and
  * every server carries `enabled: true`.
  */
@@ -253,9 +300,17 @@ function renderOpencode(def: McpServerDef): McpJsonEntry {
 
 /** Render the JSON-shaped entry for a format. Codex is handled separately (TOML). */
 export function renderJsonEntry(format: Exclude<McpFormat, 'codex'>, def: McpServerDef): McpJsonEntry {
-  if (format === 'claude') return renderClaude(def);
+  if (format === 'pi') {
+    const entry = renderClaude(def);
+    // Pi uses seconds (including fractions); team definitions use milliseconds.
+    if (def.timeout !== undefined) entry.timeout = def.timeout / 1000;
+    // Omit exposure to keep Pi's native codemode default.
+    return entry;
+  }
+  if (format === 'claude' || format === 'muse') return renderClaude(def);
   if (format === 'cursor') return renderCursor(def);
   if (format === 'opencode') return renderOpencode(def);
+  if (format === 'copilot') return renderCopilot(def);
   return renderBuddy(def);
 }
 

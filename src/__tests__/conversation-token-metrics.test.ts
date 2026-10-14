@@ -7,7 +7,7 @@ import {
   aggregateSessionMetrics,
   rebuildSessions,
 } from '../dashboard-collector.js';
-import { computePromptTokenDelta, mergePromptTokenStats } from '../team-push.js';
+import { computePromptTokenDelta, droppedRollouts, mergePromptTokenStats } from '../team-push.js';
 import { summarizeConversation, formatTokenCount } from '../digest.js';
 import type { DashboardEvent, SessionMetrics, TokenUsage, UserStats } from '../types.js';
 
@@ -24,6 +24,8 @@ afterEach(() => {
   process.env.HOME = originalHome;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+const emptyTokens = (): TokenUsage => ({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
 
 // An assistant transcript line carrying token usage for one message id.
 function assistantLine(id: string, usage: Partial<Record<string, number>>, blockType = 'text'): string {
@@ -366,6 +368,68 @@ describe('aggregateSessionMetrics', () => {
     expect(resumedReport.delta.tokens).toEqual(resumedTokens);
     expect(computePromptTokenDelta(resumedMetrics, resumedReport.nextReported).delta.tokens)
       .toEqual({ input: 0, output: 0, cacheRead: 0, cacheCreation: 0 });
+  });
+
+  it('keeps a reported rollout\'s totals once compaction drops it, so a resumed rollout is reported', () => {
+    // A Codex build that writes a new rollout per resume restarts its counters.
+    const tokensA = { input: 500, output: 50, cacheRead: 1_000, cacheCreation: 0 };
+    const tokensB = { input: 30, output: 3, cacheRead: 100, cacheCreation: 0 };
+    const stop = (path: string, tokens: TokenUsage, prompts: number): DashboardEvent => ({
+      type: 'stop', timestamp: new Date().toISOString(), sessionId: 's1', tool: 'codex',
+      transcriptPath: path, tokenScope: 'transcript', tokens, prompts,
+    });
+    const first = computePromptTokenDelta(aggregateSessionMetrics([stop('/rollouts/a.jsonl', tokensA, 5)]), {});
+    expect(first.delta).toEqual({ prompts: 5, tokens: tokensA });
+    expect(JSON.stringify(first.nextReported)).not.toContain('/rollouts/');
+
+    // Compaction dropped rollout A; the resume wrote rollout B.
+    const resumed = computePromptTokenDelta(aggregateSessionMetrics([stop('/rollouts/b.jsonl', tokensB, 2)]), first.nextReported);
+    expect(resumed.delta).toEqual({ prompts: 2, tokens: tokensB });
+    const again = computePromptTokenDelta(aggregateSessionMetrics([stop('/rollouts/b.jsonl', tokensB, 2)]), resumed.nextReported);
+    expect(again.delta).toEqual({ prompts: 0, tokens: emptyTokens() });
+  });
+
+  it('an entry from before rollouts were kept covers only the rollouts that existed when it was written', () => {
+    const tokensA = { input: 500, output: 50, cacheRead: 1_000, cacheCreation: 0 };
+    const tokensB = { input: 30, output: 3, cacheRead: 100, cacheCreation: 0 };
+    const stop = (path: string, timestamp: string, tokens: TokenUsage, prompts: number): DashboardEvent => ({
+      type: 'stop', timestamp, sessionId: 's1', tool: 'codex', transcriptPath: path, tokenScope: 'transcript', tokens, prompts,
+    });
+    const writtenAt = Date.parse('2026-09-01T12:00:00Z');
+    // An earlier release reported rollout A as a whole, with no rollouts.
+    const legacy = { s1: { prompts: 5, tokens: tokensA } };
+    const a = stop('/rollouts/a.jsonl', '2026-09-01T11:00:00Z', tokensA, 5);
+    const b = stop('/rollouts/b.jsonl', '2026-09-01T13:00:00Z', tokensB, 2);
+    // A was compacted before this build's first report; B came after the entry was written.
+    const compacted = aggregateSessionMetrics([b]);
+    expect(computePromptTokenDelta(compacted, legacy, droppedRollouts(compacted, legacy, {}, {}, writtenAt)).delta)
+      .toEqual({ prompts: 2, tokens: tokensB });
+    // A still in the log takes the entry; B is new.
+    const retained = aggregateSessionMetrics([a, b]);
+    expect(computePromptTokenDelta(retained, legacy, droppedRollouts(retained, legacy, {}, {}, writtenAt)).delta)
+      .toEqual({ prompts: 2, tokens: tokensB });
+  });
+
+  it('keeps a Codex rollout\'s latest Stop, whatever order the Stops come in', () => {
+    // A background handler appended the older scan after the newer one.
+    const cost = (costMicros: number) => ({ '2026-09-01': {
+      pricedRequests: 1, costMicros, cacheReadTokens: 0, cacheEligibleInputTokens: 0, priceVersion: 'v1',
+    } });
+    const stop = (timestamp: string, prompts: number, costMicros: number, toolReject: number): DashboardEvent => ({
+      type: 'stop', timestamp, sessionId: 's1', tool: 'codex', transcriptPath: '/rollouts/a.jsonl',
+      prompts, requestDaily: cost(costMicros), interventions: { interrupt: 0, toolReject },
+    });
+    const rollout = aggregateSessionMetrics([stop('2026-09-01T10:10:00Z', 3, 100, 2), stop('2026-09-01T10:05:00Z', 2, 40, 1)])
+      .get('s1')?.segments?.['/rollouts/a.jsonl'];
+    expect(rollout).toMatchObject({ prompts: 3, toolReject: 2, requestDaily: cost(100) });
+  });
+
+  it('counts a Codex session\'s prompts across its rollouts', () => {
+    const stop = (path: string, prompts: number): DashboardEvent => ({
+      type: 'stop', timestamp: new Date().toISOString(), sessionId: 's1', tool: 'codex',
+      transcriptPath: path, tokenScope: 'transcript', tokens: emptyTokens(), prompts,
+    });
+    expect(aggregateSessionMetrics([stop('/rollouts/a.jsonl', 5), stop('/rollouts/b.jsonl', 2)]).get('s1')?.prompts).toBe(7);
   });
 
   it('does not add transcript-scoped Codex totals to a session-scoped snapshot', () => {

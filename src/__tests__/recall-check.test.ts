@@ -7,15 +7,20 @@ import fse from 'fs-extra';
 // (RELEVANT / NOT_RELEVANT + score) and exits before recording quality or
 // formatting full results.
 
-vi.mock('../config.js', () => ({
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
   detectProjectConfig: vi.fn(),
   requireInit: vi.fn(),
+}));
+vi.mock('../code-knowledge-recall.js', () => ({
+  queryCodeKnowledge: vi.fn().mockResolvedValue([]),
 }));
 
 import { recall } from '../recall.js';
 import { detectProjectConfig } from '../config.js';
+import { queryCodeKnowledge } from '../code-knowledge-recall.js';
 import { buildIndex } from '../utils/search-index.js';
-import { getTeamaiHome, type LocalConfig } from '../types.js';
+import { getTeamaiHome, SEARCH_INDEX_VERSION, type LocalConfig, type SearchIndex } from '../types.js';
 import { readRecallQuality } from '../recall-quality.js';
 
 const CHECK_LEARNING_TITLE = 'Deployment Timeout Retry Policy';
@@ -101,6 +106,92 @@ describe('recall --check precheck mode', () => {
     await recall('completely unrelated gibberish xyzzy quantum', { check: true });
 
     expect(captured).toMatch(/^NOT_RELEVANT score=\d+\.\d+ threshold=\d+\.\d+\n$/);
+  });
+
+  it('ranks graph hits against corpus-normalized learnings scores', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+    vi.mocked(queryCodeKnowledge).mockResolvedValueOnce([{
+      page: 'evidence/code/demo/docs/agent-session-recovery.md',
+      title: 'Agent Session Recovery',
+      score: 100,
+      snippet: 'The graph page matches the full query.',
+      kind: 'codebase',
+    }]);
+
+    const learningsDir = path.join(projectConfig.repo.localPath, 'learnings');
+    await fse.remove(path.join(learningsDir, 'proj-deploy-2026-05-01-ccc.md'));
+    await fse.writeFile(
+      path.join(learningsDir, 'cross-scale-learning.md'),
+      [
+        '---',
+        'title: "Deployment Timeout Retry"',
+        'author: tester',
+        'date: 2026-05-01',
+        'tags: [deployment]',
+        '---',
+        '',
+        'General operational notes with no additional query matches.',
+        '',
+      ].join('\n'),
+    );
+    for (let i = 0; i < 100; i++) {
+      await fse.writeFile(
+        path.join(learningsDir, `unrelated-${i}.md`),
+        [
+          '---',
+          `title: "Unrelated Background Record ${i}"`,
+          'author: tester',
+          'date: 2026-05-01',
+          'tags: [background]',
+          '---',
+          '',
+          'General onboarding notes with no query-specific terms.',
+          '',
+        ].join('\n'),
+      );
+    }
+    await buildIndex({
+      learningsDir,
+      indexPath: path.join(getTeamaiHome('project', projectRoot), 'search-index.json'),
+    });
+
+    await recall('deployment timeout retry policy', { dryRun: true });
+
+    const graphPosition = captured.indexOf('[docs] Agent Session Recovery');
+    const learningPosition = captured.indexOf('[learnings] Deployment Timeout Retry');
+    expect(graphPosition).toBeGreaterThanOrEqual(0);
+    expect(learningPosition).toBeGreaterThanOrEqual(0);
+    expect(graphPosition).toBeLessThan(learningPosition);
+  });
+
+  it('keeps a relevant technical hit beyond five higher raw-scoring ops hits', async () => {
+    vi.mocked(detectProjectConfig).mockResolvedValue(projectConfig);
+
+    const entry = (filename: string, title: string, domain: 'technical' | 'ops', tokens: string[]): SearchIndex['entries'][number] => ({
+      filename, title, domain, tokens, author: 'tester', date: '2026-05-01',
+      tags: [], votes: 0, type: 'learnings',
+    });
+    const index: SearchIndex = {
+      version: SEARCH_INDEX_VERSION,
+      builtAt: new Date().toISOString(),
+      elapsedMs: 0,
+      entries: [
+        entry('technical.md', 'API Technical Reference', 'technical', ['title:api', 'tag:api', 'api']),
+        ...Array.from({ length: 5 }, (_, i) => entry(`ops-hit-${i}.md`, `API Ops ${i}`, 'ops', ['title:api'])),
+        ...Array.from({ length: 195 }, (_, i) => entry(`ops-other-${i}.md`, `Ops Other ${i}`, 'ops', [])),
+      ],
+      df: { 'title:api': 6, 'tag:api': 1, api: 1 },
+      dfByDomain: {
+        technical: { 'title:api': 1, 'tag:api': 1, api: 1 },
+        ops: { 'title:api': 5 },
+      },
+    };
+    await fse.writeJson(path.join(getTeamaiHome('project', projectRoot), 'search-index.json'), index);
+
+    await recall('api', { check: true });
+
+    expect(captured).toMatch(/^RELEVANT /);
+    expect(captured).toContain('title="API Technical Reference"');
   });
 
   it('check mode does not record recall quality (no side effects)', async () => {

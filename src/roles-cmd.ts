@@ -1,13 +1,12 @@
 import path from 'node:path';
 import YAML from 'yaml';
-import { autoDetectInit, loadLocalConfig, saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
-import { loadRolesManifest, saveRolesManifest, findRole, describeRoles, listRoleIds } from './roles.js';
+import { autoDetectInit, saveLocalConfig, saveLocalConfigForScope, loadStateForScope, saveStateForScope } from './config.js';
+import { loadRolesManifest, saveRolesManifest, findRole, listRoleIds } from './roles.js';
 import type { RolesManifest, TeamRole } from './roles.js';
-import { pullRepo, pushRepoBranch, checkoutMaster, generateBranchName } from './utils/git.js';
-import { ensureDir, pathExists, writeFile, expandHome } from './utils/fs.js';
-import { log, spinner } from './utils/logger.js';
-import { createPrWithFallback } from './push.js';
-import type { GlobalOptions, TeamaiConfig, LocalConfig } from './types.js';
+import { pathExists } from './utils/fs.js';
+import { log } from './utils/logger.js';
+import { pullLatest, runManifestEdit, pushManifestChange } from './manifest-edit.js';
+import type { GlobalOptions, LocalConfig, TeamaiConfig } from './types.js';
 import { askQuestion, askConfirmation } from './utils/prompt.js';
 
 /**
@@ -20,96 +19,22 @@ function parseNamespaces(input: string): string[] {
         .filter(Boolean);
 }
 
-// ─── Shared: pull latest + push branch + PR ──────────────
-
-async function pullLatest(repoPath: string): Promise<void> {
-    const pullSpin = spinner('Pulling latest changes...').start();
-    try {
-        await pullRepo(repoPath);
-        pullSpin.succeed('Up to date');
-    } catch (e) {
-        pullSpin.warn(`Pull failed: ${(e as Error).message}`);
-    }
-}
-
-/**
- * Run a roles-manifest admin edit (write manifest + open PR) against the right
- * repo. In single-repo mode the manifest is knowledge on main, so the edit runs
- * inside an isolated knowledge worktree (never the user's active tree). `fn`
- * receives the repoPath to read/write the manifest and the localConfig to use for
- * the PR — both already scoped to the worktree in self mode.
- */
-async function runRolesEdit(
-    localConfig: LocalConfig,
-    fn: (repoPath: string, editConfig: LocalConfig) => Promise<void>,
-): Promise<void> {
-    if (localConfig.repo.kind === 'self') {
-        const { withKnowledgeWorktree, EmptyRepoError } = await import('./utils/reports-branch.js');
-        try {
-            await withKnowledgeWorktree(localConfig, (wtConfig) => fn(wtConfig.repo.localPath, wtConfig));
-        } catch (e) {
-            if (e instanceof EmptyRepoError) {
-                log.error(e.message);
-            } else {
-                log.error(`Roles update failed: ${(e as Error).message}`);
-            }
-        }
-        return;
-    }
-    await fn(localConfig.repo.localPath, localConfig);
-}
-
-async function pushManifestChange(input: {
-    repoPath: string;
-    teamConfig: TeamaiConfig;
-    localConfig: LocalConfig;
-    commitMsg: string;
-    prDescription: string;
-}): Promise<void> {
-    const { repoPath, teamConfig, localConfig, commitMsg, prDescription } = input;
-    const branchName = generateBranchName(localConfig.username);
-
-    try {
-        const hasChanges = await pushRepoBranch(
-            repoPath,
-            commitMsg,
-            ['manifest/'],
-            branchName,
-        );
-
-        if (!hasChanges) {
-            log.info('No changes to push (manifest unchanged)');
-            return;
-        }
-
-        log.success(`Pushed branch ${branchName}`);
-
-        await createPrWithFallback(
-            teamConfig,
-            localConfig,
-            branchName,
-            commitMsg,
-            prDescription,
-        );
-
-        await checkoutMaster(repoPath);
-    } catch (e) {
-        log.error(`Push failed: ${(e as Error).message}`);
-    }
-}
-
 // ─── roles init ─────────────────────────────────────────
 
 export async function rolesInit(options: GlobalOptions): Promise<void> {
-    const { localConfig, teamConfig } = await autoDetectInit();
-    const repoPath = localConfig.repo.localPath;
-    const selfMode = localConfig.repo.kind === 'self';
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
+    if (options.dryRun && localConfig.repo.kind !== 'self') {
+        await runManifestEdit(localConfig, 'Roles', async (_repoPath, previewConfig) => {
+            await initializeRoles(options, previewConfig, teamConfig);
+        }, { dryRun: true });
+        return;
+    }
+    if (!options.dryRun && localConfig.repo.kind !== 'self') await pullLatest(localConfig.repo.localPath);
+    await initializeRoles(options, localConfig, teamConfig);
+}
 
-    // In self mode the manifest is knowledge on main; the on-disk .teamai already
-    // reflects main, so we read the existence check from there and only run the
-    // actual write+PR inside an isolated worktree (below). Non-self modes pull the
-    // team repo clone first.
-    if (!selfMode) await pullLatest(repoPath);
+async function initializeRoles(options: GlobalOptions, localConfig: LocalConfig, teamConfig: TeamaiConfig): Promise<void> {
+    const repoPath = localConfig.repo.localPath;
 
     // Check if manifest already exists
     const manifestPath = path.join(repoPath, 'manifest', 'roles.yaml');
@@ -203,7 +128,7 @@ export async function rolesInit(options: GlobalOptions): Promise<void> {
     log.info('Example: mv skills/hai-deploy-test skills/hai/hai-deploy-test');
 
     const commitMsg = `[teamai] Initialize roles manifest with ${roles.length} role(s)`;
-    await runRolesEdit(localConfig, async (editRepoPath, editConfig) => {
+    await runManifestEdit(localConfig, 'Roles', async (editRepoPath, editConfig) => {
         await saveRolesManifest(editRepoPath, manifest);
         log.success(`Manifest written to ${path.join(editRepoPath, 'manifest', 'roles.yaml')}`);
         await pushManifestChange({
@@ -213,13 +138,14 @@ export async function rolesInit(options: GlobalOptions): Promise<void> {
             commitMsg,
             prDescription: `Initialize roles manifest:\n${roles.map((r) => `- ${r.id} (namespaces: ${r.resources.skills.join(', ')})`).join('\n')}`,
         });
-    });
+    }, { skipPull: true }); // Keep the checkout checked before the interactive questions.
 }
 
 // ─── roles list ─────────────────────────────────────────
 
-export async function rolesList(options: GlobalOptions): Promise<void> {
-    const { localConfig } = await autoDetectInit();
+export async function rolesList(): Promise<void> {
+    // Read-only: the load never persists a migration (#893).
+    const { localConfig } = await autoDetectInit(undefined, { dryRun: true });
     const repoPath = localConfig.repo.localPath;
 
     let manifest;
@@ -260,7 +186,7 @@ export async function rolesSet(
     primaryRole: string,
     options: GlobalOptions & { add?: string[] },
 ): Promise<void> {
-    const { localConfig } = await autoDetectInit();
+    const { localConfig } = await autoDetectInit(undefined, options);
     const repoPath = localConfig.repo.localPath;
 
     let manifest;
@@ -287,6 +213,11 @@ export async function rolesSet(
             log.error(`Unknown additional role "${id}". Valid roles: ${[...validIds].join(', ')}`);
             return;
         }
+    }
+
+    if (options.dryRun) {
+        log.info(`[dry-run] Would set primary role to: ${primaryRole}, additional roles: ${additionalRoles.join(', ') || 'none'}`);
+        return;
     }
 
     // Update local config
@@ -331,11 +262,9 @@ export async function rolesAdd(
         return;
     }
 
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
-    await runRolesEdit(localConfig, async (repoPath, editConfig) => {
-        if (editConfig.repo.kind !== 'self') await pullLatest(repoPath);
-
+    await runManifestEdit(localConfig, 'Roles', async (repoPath, editConfig) => {
         let manifest: RolesManifest;
         try {
             manifest = await loadRolesManifest(repoPath);
@@ -382,7 +311,7 @@ export async function rolesAdd(
             commitMsg,
             prDescription: `Add role "${roleId}" with namespaces: ${namespaces.join(', ')}${options.description ? `\nDescription: ${options.description}` : ''}`,
         });
-    });
+    }, { dryRun: options.dryRun });
 }
 
 // ─── roles remove ───────────────────────────────────────
@@ -391,11 +320,9 @@ export async function rolesRemove(
     roleId: string,
     options: GlobalOptions,
 ): Promise<void> {
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
-    await runRolesEdit(localConfig, async (repoPath, editConfig) => {
-        if (editConfig.repo.kind !== 'self') await pullLatest(repoPath);
-
+    await runManifestEdit(localConfig, 'Roles', async (repoPath, editConfig) => {
         let manifest: RolesManifest;
         try {
             manifest = await loadRolesManifest(repoPath);
@@ -438,7 +365,7 @@ export async function rolesRemove(
             commitMsg,
             prDescription: `Remove role "${roleId}". Remaining roles: ${remaining.map((r) => r.id).join(', ')}`,
         });
-    });
+    }, { dryRun: options.dryRun });
 }
 
 // ─── roles update ───────────────────────────────────────
@@ -460,11 +387,9 @@ export async function rolesUpdate(
         return;
     }
 
-    const { localConfig, teamConfig } = await autoDetectInit();
+    const { localConfig, teamConfig } = await autoDetectInit(undefined, { dryRun: options.dryRun });
 
-    await runRolesEdit(localConfig, async (repoPath, editConfig) => {
-        if (editConfig.repo.kind !== 'self') await pullLatest(repoPath);
-
+    await runManifestEdit(localConfig, 'Roles', async (repoPath, editConfig) => {
         let manifest: RolesManifest;
         try {
             manifest = await loadRolesManifest(repoPath);
@@ -508,6 +433,8 @@ export async function rolesUpdate(
             ...existingRole,
             description: hasDesc ? options.description! : existingRole.description,
             resources: {
+                // Keeps the hand-declared types (env, hooks, mcp, models, docs).
+                ...existingRole.resources,
                 knowledge: updatedNamespaces,
                 skills: updatedNamespaces,
                 agents: updatedNamespaces,
@@ -542,5 +469,5 @@ export async function rolesUpdate(
             commitMsg,
             prDescription: `Update role "${roleId}": ${changes.join(', ')}`,
         });
-    });
+    }, { dryRun: options.dryRun });
 }

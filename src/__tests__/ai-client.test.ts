@@ -151,7 +151,7 @@ describe('callClaudeParallel', () => {
         close: (code: number | null) => void;
       };
       // 在下一个微任务触发
-      Promise.resolve().then(() => {
+      queueMicrotask(() => {
         emitters.stdout(Buffer.from(response));
         emitters.close(0);
       });
@@ -184,7 +184,7 @@ describe('callClaudeParallel', () => {
       };
 
       // 立即完成，不阻塞
-      Promise.resolve().then(() => {
+      queueMicrotask(() => {
         running--;
         emitters.stdout(Buffer.from('done'));
         emitters.close(0);
@@ -310,5 +310,37 @@ describe('resolveCliPath', () => {
 
     expect(resolveCliPath('claude', 'darwin')).toBe('/opt/homebrew/bin/claude');
     expect(execFileSyncMock.mock.calls.map((call) => call[0])).toEqual(['bash', 'zsh']);
+  });
+});
+
+// ─── windowsHide ───────────────────────────────────────────────────────────
+// CI only runs ubuntu / macos, so the spawn options themselves are the only
+// thing that can be asserted: they are what keeps a console window from
+// appearing when the host process (an editor, or the hook dispatcher) has none.
+
+describe('callClaude — windowsHide', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('starts the AI CLI as a child that cannot open a console window', async () => {
+    const child = makeMockProcess();
+    const emit = (child as unknown as Record<string, unknown>)._emit as {
+      stdout: (chunk: Buffer) => void;
+      close: (code: number | null) => void;
+    };
+    vi.mocked(spawn).mockReturnValue(child as unknown as ChildProcess);
+
+    const promise = callClaude('test prompt');
+    emit.stdout(Buffer.from('ok'));
+    emit.close(0);
+    await promise;
+
+    const [, , options] = vi.mocked(spawn).mock.calls[0] as [
+      string,
+      string[],
+      { windowsHide?: boolean },
+    ];
+    expect(options.windowsHide).toBe(true);
   });
 });
