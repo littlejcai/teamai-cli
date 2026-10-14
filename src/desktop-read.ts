@@ -82,6 +82,11 @@ export async function desktopSnapshot(ctx: DesktopContext) {
     state: 'ready' as const, configPath, repoPath: config.repo.localPath, remote: config.repo.remote,
     username: config.username, role: config.primaryRole, scope: config.scope, git,
     lastPull: state.lastPull ?? null, lastPush: state.lastPush ?? null,
+    // [teamai-desktop] Read existing contribution receipts and deployment locations only.
+    pendingPushes: state.pendingPushes ?? [],
+    toolTargets: Object.entries(team.toolPaths).filter(([agent]) =>
+      config.enabledAgents ? config.enabledAgents.includes(agent as never) : !config.disabledAgents?.includes(agent as never)
+    ).map(([agent, paths]) => ({ agent, skills: paths.skills ? path.resolve(config.scope === 'project' ? config.projectRoot! : (ctx.home ?? os.homedir()), paths.skills) : null })),
     resources, changes, roles: roles?.roles ?? [], projects: projects?.projects ?? [],
     namespaces: [...new Set([...(roles?.roles.flatMap(r => r.resources.skills) ?? []),...await scanTeamRepoNamespaces(config.repo.localPath)])],
     needsMigration: Boolean(roles && !config.primaryRole), enabledAgents: config.enabledAgents ?? [],
