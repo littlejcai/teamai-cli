@@ -37,3 +37,6 @@ export { desktopConfig, desktopSnapshot, desktopManifest } from './desktop-read.
 export { init } from './init.js';
 export { push } from './push.js';
 export { doctor } from './doctor.js';
+
+// [teamai-desktop] Request-scoped logging, in the isolated desktop worker only.
+export { setVerbose } from './utils/logger.js';
